@@ -107,7 +107,8 @@ enum MarkdownRenderer {
             i += 1
         }
         flushParagraph()
-        return out.joined(separator: "\n")
+        // 块之间插入空行，备忘录里保留段落间距
+        return out.joined(separator: "<div><br></div>")
     }
 
     // MARK: - Inline
@@ -124,6 +125,12 @@ enum MarkdownRenderer {
         // 行内代码（先保护，避免内部被再加格式）
         s = replaceRegex(#"`([^`]+)`"#, in: s) { m in
             stashHTML("<code>" + s.substring(m.range(at: 1)) + "</code>")
+        }
+        // 图床图片 ![](url)（先于链接处理，避免被拆成 "!" + 空链接）
+        s = replaceRegex(#"!\[([^\]]*)\]\(([^)\s]+)\)"#, in: s) { m in
+            let alt = s.substring(m.range(at: 1))
+            let url = s.substring(m.range(at: 2))
+            return stashHTML("<img src=\"\(url)\" alt=\"\(alt)\">")
         }
         // 加粗
         s = replaceRegex(#"(\*\*|__)(.+?)\1"#, in: s) { m in
@@ -162,6 +169,44 @@ enum MarkdownRenderer {
                 return m[0]
             }
             break // 只看第一个非空行
+        }
+        return nil
+    }
+
+    /// 推送备忘录用的 markdown：确保首个非空行是最终标题 H1。
+    /// 实验确认：Notes 会把正文首行渲染为 24px 加粗并用作笔记名，
+    /// 因此不再显式设置 name（显式 name 行是普通字重，且会与正文 H1 重复）。
+    /// - explicitTitle 非空时：已有首标题则替换其文本，否则在首行前插入新标题；
+    ///   为空时：保持原文不变。
+    static func noteMarkdown(_ markdown: String, explicitTitle: String) -> String {
+        let lines = markdown
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: "\n")
+        guard let idx = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+        else { return markdown }
+        var result = lines
+        if let m = match(#"^(#{1,6})\s+(.+?)\s*#*\s*$"#, lines[idx]) {
+            result[idx] = "# " + (explicitTitle.isEmpty ? m[1] : explicitTitle)
+        } else if !explicitTitle.isEmpty {
+            result.insert("# " + explicitTitle, at: idx)
+        }
+        return result.joined(separator: "\n")
+    }
+
+    /// 若第一个非空行是 ATX 标题，返回 (标题文本, 去掉该行后的 markdown)；否则 nil。
+    /// 供 CLI/测试使用：推送路径现在改用 noteMarkdown（保留首标题 H1 作加粗主标题）。
+    static func splitFirstHeading(_ markdown: String) -> (title: String, body: String)? {
+        let lines = markdown
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .components(separatedBy: "\n")
+        for (idx, line) in lines.enumerated() {
+            guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            if let m = match(#"^(#{1,6})\s+(.+?)\s*#*\s*$"#, line) {
+                var rest = lines
+                rest.remove(at: idx)
+                return (m[1], rest.joined(separator: "\n"))
+            }
+            return nil
         }
         return nil
     }

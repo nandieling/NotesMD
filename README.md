@@ -13,6 +13,10 @@ macOS 小工具应用：Dock 图标常驻，同时在顶部菜单栏提供图标
 - **复制富文本**（⇧⌘C）：只复制渲染结果（RTF/HTML/纯文本）到剪贴板，自己选位置粘贴
 - **全局快捷键 ⌥⌘M**：随时呼出 / 隐藏窗口
 - **Markdown 文件编辑**：新建（⌘N）、打开（⌘O）、保存（⌘S）、另存为（⇧⌘S）；支持 `.md` / `.markdown` / `.mdown`，可直接在 Finder 里用 NotesMD 打开 .md 文件；菜单中可一键「设为 .md 默认打开程序」
+- **预览背景图**：顶栏「背景图片…」选择图片铺满整个窗口（编辑区 + 预览区），「透明度」滑杆调节不透明度，「清除背景」移除；设置会记住，重启后自动恢复。添加背景不改变窗口大小与比例
+- **图床图片 `![](url)`**：预览区异步下载并显示图片（带缓存、占位框、限宽）；支持 `http/https/file://` 与本地绝对路径，有 `alt` 时图下显示说明文字
+- **粘贴图片自动转链接**：在编辑区直接 ⌘V 粘贴图片，会存到本地图床（`~/Library/Application Support/NotesMD/images/`）并写成 `![](路径)`；粘贴带图床 URL 的剪贴板则直接写成 `![](url)`
+- **备忘录排版**：正文首行标题渲染为加粗大标题并用作笔记名（不重复），块之间保留段落空行
 - **菜单栏图标**：显示/隐藏、打开、保存、三种写入方式、设默认应用、退出
 
 ## 构建与运行
@@ -48,11 +52,15 @@ open build/NotesMD.app
 `build/NotesMD.app` 内的可执行文件（或 `swift build -c release` 后的 `.build/release/NotesMD`）支持以下参数：
 
 ```bash
-.build/release/NotesMD --html note.md   # 输出该 markdown 文件的 HTML
-.build/release/NotesMD --png out.png    # 把示例内容渲染为 PNG
-.build/release/NotesMD --layout         # 打印窗口布局信息后退出（调试用）
-.build/release/NotesMD --smoke          # 冒烟测试：渲染示例并真实创建一条备忘录
+.build/release/NotesMD --html note.md            # 输出该 markdown 文件的 HTML
+.build/release/NotesMD --png in.md out.png       # 把该 markdown 文件渲染为 PNG（静态，不等图片下载）
+.build/release/NotesMD --layout                  # 打印窗口布局信息后退出（调试用）
+.build/release/NotesMD --smoke                   # 冒烟测试：渲染示例并真实创建一条备忘录
+.build/release/NotesMD --screenshot in.md out.png [bg.png] [alpha] [paste.png]
+                                                 # 加载内容截图（可选背景图/透明度/模拟粘贴图片，调试用）
 ```
+
+`--screenshot` 的等待时长按环境变量 `NMD_SHOT_WAIT`（秒，默认 5）控制，便于等远程图片下载完成。
 
 ## 上传 GitHub 前排查
 
@@ -73,4 +81,6 @@ Sources/NotesMD/main.swift        窗口、菜单栏、全局快捷键、文件�
 Sources/NotesMD/MarkdownRenderer.swift   Markdown → HTML / 富文本（HTML 输出方向）
 Sources/NotesMD/MarkdownRender.swift     Markdown → NSAttributedString（进程内渲染预览，不依赖 XPC 服务）
 Sources/NotesMD/NotesService.swift       osascript 建笔记、剪贴板、模拟 ⌘V 粘贴
+Sources/NotesMD/ImageStore.swift         图床图片下载、缓存、占位图
+Sources/NotesMD/MediaStore.swift         粘贴图片的本地图床存储
 ```

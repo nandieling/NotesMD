@@ -7,15 +7,16 @@ enum NotesService {
     static let notesBundleID = "com.apple.Notes"
 
     /// 在备忘录中创建一条新笔记（HTML 正文由 Notes 自行排版）。
+    /// 不显式设置 name：Notes 会把正文首行（H1 标题）渲染为加粗大标题并用作笔记名，
+    /// 显式 name 则是普通字重且会与正文标题重复（两个主标题）。
     @discardableResult
-    static func createNote(title: String, html: String) -> Result<Void, Error> {
+    static func createNote(html: String) -> Result<Void, Error> {
         let script = """
         on run argv
             set theHTML to item 1 of argv
-            set theTitle to item 2 of argv
             tell application "Notes"
                 activate
-                make new note with properties {name:theTitle, body:theHTML}
+                make new note with properties {body:theHTML}
             end tell
         end run
         """
@@ -29,7 +30,7 @@ enum NotesService {
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = [scriptPath, html, title]
+        p.arguments = [scriptPath, html]
         let errPipe = Pipe()
         p.standardError = errPipe
         do { try p.run() } catch { return .failure(error) }

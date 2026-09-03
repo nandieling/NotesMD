@@ -7,6 +7,14 @@ import Foundation
 extension MarkdownRenderer {
 
     static func render(_ markdown: String) -> NSAttributedString {
+        render(markdown, contentWidth: 720, onImageLoaded: nil)
+    }
+
+    /// - contentWidth: 预览区内容宽度（pt），用于约束图床图片展示尺寸
+    /// - onImageLoaded: 某张图床图片下载完成后回调（用于重新渲染）
+    static func render(_ markdown: String,
+                       contentWidth: CGFloat,
+                       onImageLoaded: (() -> Void)? = nil) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let lines = markdown
             .replacingOccurrences(of: "\r\n", with: "\n")
@@ -40,9 +48,9 @@ extension MarkdownRenderer {
                 .foregroundColor: NSColor.labelColor,
                 .paragraphStyle: style(after: 8, line: 4)
             ]
-            for (idx, line) in paragraph.enumerated() {
-                out.append(attributedInline(line, base: attrs))
-                if idx < paragraph.count - 1 { append("\n", attrs) }
+            for line in paragraph {
+                out.append(attributedInline(line, base: attrs, contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+                append("\n", attrs)
             }
             paragraph = []
         }
@@ -115,8 +123,8 @@ extension MarkdownRenderer {
                         .paragraphStyle: style(head: 18, first: 18,
                                                before: idx == 0 ? 4 : 0, after: last ? 8 : 2)
                     ]
-                    out.append(attributedInline(q, base: attrs))
-                    if !last { append("\n", attrs) }
+                    out.append(attributedInline(q, base: attrs, contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+                    append("\n", attrs)
                 }
                 continue
             }
@@ -135,8 +143,8 @@ extension MarkdownRenderer {
                         .paragraphStyle: style(head: 20, first: 0, after: last ? 8 : 2, line: 3)
                     ]
                     append("\u{2022}  ", attrs)
-                    out.append(attributedInline(listContent(lines[k]), base: attrs))
-                    if !last { append("\n", attrs) }
+                    out.append(attributedInline(listContent(lines[k]), base: attrs, contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+                    append("\n", attrs)
                 }
                 continue
             }
@@ -155,8 +163,8 @@ extension MarkdownRenderer {
                         .paragraphStyle: style(head: 24, first: 4, after: last ? 8 : 2, line: 3)
                     ]
                     append("\(idx + 1).  ", attrs)
-                    out.append(attributedInline(listContent(lines[k]), base: attrs))
-                    if !last { append("\n", attrs) }
+                    out.append(attributedInline(listContent(lines[k]), base: attrs, contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+                    append("\n", attrs)
                 }
                 continue
             }
@@ -173,31 +181,37 @@ extension MarkdownRenderer {
         return out
     }
 
-    /// 内联语法 -> 富文本：行内代码 > 加粗 > 斜体 > 删除线 > 链接
-    static func attributedInline(_ raw: String, base: [NSAttributedString.Key: Any]) -> NSAttributedString {
+    /// 内联语法 -> 富文本：行内代码 > 图片 > 加粗 > 斜体 > 删除线 > 链接
+    static func attributedInline(_ raw: String, base: [NSAttributedString.Key: Any],
+                                 contentWidth: CGFloat = 720,
+                                 onImageLoaded: (() -> Void)? = nil) -> NSAttributedString {
         let result = NSMutableAttributedString()
         var rest = raw
 
         while true {
-            var best: (loc: Int, end: Int, kind: Int, inner: String)?
-            func consider(_ pattern: String, kind: Int, group: Int) {
+            var best: (loc: Int, end: Int, kind: Int, groups: [String])?
+            func consider(_ pattern: String, kind: Int) {
                 guard let re = try? NSRegularExpression(pattern: pattern),
                       let m = re.firstMatch(in: rest, range: NSRange(location: 0, length: (rest as NSString).length)),
                       m.range.location != NSNotFound else { return }
-                let inner = (rest as NSString).substring(with: m.range(at: group))
+                var groups: [String] = []
+                for g in 1..<m.numberOfRanges {
+                    groups.append((rest as NSString).substring(with: m.range(at: g)))
+                }
                 if let cur = best {
                     if m.range.location < cur.loc || (m.range.location == cur.loc && kind < cur.kind) {
-                        best = (m.range.location, m.range.upperBound, kind, inner)
+                        best = (m.range.location, m.range.upperBound, kind, groups)
                     }
                 } else {
-                    best = (m.range.location, m.range.upperBound, kind, inner)
+                    best = (m.range.location, m.range.upperBound, kind, groups)
                 }
             }
-            consider(#"`([^`]+)`"#, kind: 0, group: 1)
-            consider(#"(\*\*|__)(.+?)\1"#, kind: 1, group: 2)
-            consider(#"(\*|_)([^*_]+?)\1"#, kind: 2, group: 2)
-            consider(#"~~(.+?)~~"#, kind: 3, group: 1)
-            consider(#"\[([^\]]+)\]\(([^)\s]+)\)"#, kind: 4, group: 1)
+            consider(#"`([^`]+)`"#, kind: 0)
+            consider(#"!\[([^\]]*)\]\(([^)\s]+)\)"#, kind: 1)
+            consider(#"(\*\*|__)(.+?)\1"#, kind: 2)
+            consider(#"(\*|_)([^*_]+?)\1"#, kind: 3)
+            consider(#"~~(.+?)~~"#, kind: 4)
+            consider(#"\[([^\]]+)\]\(([^)\s]+)\)"#, kind: 5)
 
             guard let b = best else {
                 if !rest.isEmpty {
@@ -218,24 +232,55 @@ extension MarkdownRenderer {
                     attrs[.font] = NSFont.monospacedSystemFont(ofSize: max(f.pointSize - 1.5, 10), weight: .regular)
                 }
                 attrs[.backgroundColor] = NSColor(white: 0.93, alpha: 1)
-                result.append(NSAttributedString(string: b.inner, attributes: attrs))
+                result.append(NSAttributedString(string: b.groups[0], attributes: attrs))
             case 1:
+                // 图床图片：以文本附件插入；未命中缓存时先放占位图，下载完成后整体重渲染
+                let alt = b.groups[0]
+                if let url = ImageStore.url(from: b.groups[1]) {
+                    let maxWidth = max(contentWidth, 120)
+                    let attachment = NSTextAttachment()
+                    if let img = ImageStore.shared.cached(url) {
+                        attachment.image = ImageStore.scaled(
+                            img, toSize: ImageStore.fitSize(img.size, maxWidth: maxWidth, maxHeight: 560))
+                    } else {
+                        attachment.image = ImageStore.placeholder(
+                            size: NSSize(width: min(240, maxWidth), height: 120))
+                        ImageStore.shared.image(for: url) { img in
+                            if img != nil { onImageLoaded?() }
+                        }
+                    }
+                    result.append(NSAttributedString(attachment: attachment))
+                    if !alt.isEmpty {
+                        var caption = attrs
+                        if let f = caption[.font] as? NSFont {
+                            caption[.font] = NSFont.systemFont(ofSize: max(f.pointSize - 3, 10))
+                        }
+                        caption[.foregroundColor] = NSColor.secondaryLabelColor
+                        result.append(NSAttributedString(string: "\n" + alt, attributes: caption))
+                    }
+                } else {
+                    result.append(NSAttributedString(string: "![](" + b.groups[1] + ")", attributes: attrs))
+                }
+            case 2:
                 if let f = attrs[.font] as? NSFont {
                     attrs[.font] = NSFont.boldSystemFont(ofSize: f.pointSize)
                 }
-                result.append(attributedInline(b.inner, base: attrs))
-            case 2:
+                result.append(attributedInline(b.groups[1], base: attrs,
+                                               contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+            case 3:
                 if let f = attrs[.font] as? NSFont {
                     attrs[.font] = NSFontManager.shared.convert(f, toHaveTrait: .italicFontMask)
                 }
-                result.append(attributedInline(b.inner, base: attrs))
-            case 3:
+                result.append(attributedInline(b.groups[1], base: attrs,
+                                               contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+            case 4:
                 attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
-                result.append(attributedInline(b.inner, base: attrs))
+                result.append(attributedInline(b.groups[0], base: attrs,
+                                               contentWidth: contentWidth, onImageLoaded: onImageLoaded))
             default:
                 attrs[.foregroundColor] = NSColor.linkColor
                 attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                result.append(NSAttributedString(string: b.inner, attributes: attrs))
+                result.append(NSAttributedString(string: b.groups[0], attributes: attrs))
             }
             rest = (rest as NSString).substring(from: b.end)
         }
