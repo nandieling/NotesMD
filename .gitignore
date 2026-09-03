@@ -1,3 +1,21 @@
-.build/
-build/
+# macOS
 .DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+
+# 构建产物（make-app.sh 生成，可重新构建）
+build/
+*.app
+
+# 环境与编辑器
+.env
+.idea/
+.vscode/

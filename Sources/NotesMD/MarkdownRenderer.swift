@@ -159,7 +159,7 @@ enum MarkdownRenderer {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { continue }
             if let m = match(#"^#{1,6}\s+(.+?)\s*#*\s*$"#, line) {
-                return m[1]
+                return m[0]
             }
             break // 只看第一个非空行
         }
@@ -203,28 +203,28 @@ enum MarkdownRenderer {
          .replacingOccurrences(of: ">", with: "&gt;")
     }
 
-    private static func isHorizontalRule(_ t: String) -> Bool {
+    static func isHorizontalRule(_ t: String) -> Bool {
         guard t.count >= 3 else { return false }
         let set = Set(t)
         return set.isSubset(of: Set("-")) || set.isSubset(of: Set("*")) || set.isSubset(of: Set("_"))
     }
 
-    private static func isUnorderedItem(_ line: String) -> Bool {
+    static func isUnorderedItem(_ line: String) -> Bool {
         match(#"^\s*[-*+]\s+\S"#, line) != nil
     }
 
-    private static func isOrderedItem(_ line: String) -> Bool {
+    static func isOrderedItem(_ line: String) -> Bool {
         match(#"^\s*\d+[.)]\s+\S"#, line) != nil
     }
 
-    private static func listContent(_ line: String) -> String {
+    static func listContent(_ line: String) -> String {
         if let m = match(#"^\s*[-*+]\s+(.*)$"#, line) { return m[0] }
         if let m = match(#"^\s*\d+[.)]\s+(.*)$"#, line) { return m[0] }
         return line
     }
 
     /// 返回分组捕获（不含整体匹配）
-    private static func match(_ pattern: String, _ input: String) -> [String]? {
+    static func match(_ pattern: String, _ input: String) -> [String]? {
         guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
         let ns = input as NSString
         guard let m = re.firstMatch(in: input, range: NSRange(location: 0, length: ns.length)) else { return nil }

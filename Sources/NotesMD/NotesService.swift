@@ -45,10 +45,11 @@ enum NotesService {
     }
 
     /// 把渲染结果（RTF + HTML + 纯文本）放入剪贴板，可直接 ⌘V 进备忘录。
-    static func copyRich(html: String) {
+    static func copyRich(markdown: String) {
+        let html = MarkdownRenderer.html(from: markdown)
         let pb = NSPasteboard.general
         pb.clearContents()
-        let attr = MarkdownRenderer.attributed(fromHTML: html)
+        let attr = MarkdownRenderer.render(markdown)
         pb.writeObjects([attr])
         if let data = html.data(using: .utf8) {
             pb.setData(data, forType: .html)
