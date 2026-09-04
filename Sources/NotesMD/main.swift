@@ -53,9 +53,9 @@ enum Sample {
     ```
 
     ## 三种用法
-    1. 新建备忘录：生成一条原生排版的备忘录
-    2. 粘贴到当前备忘录：对已打开的笔记直接 ⌘V
-    3. 复制富文本：自行选择粘贴位置
+    1. 新建备忘录并粘贴：生成一条原生排版的备忘录，富文本同时进剪贴板
+    2. 复制为富文本：自行选择粘贴位置
+    3. 右上角「自动保存」：打开文件后停顿 0.6 秒自动保存
 
     ---
     全局快捷键：⌥⌘M 打开 / 隐藏窗口
@@ -136,6 +136,10 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
     private var bgClearButton: NSButton!
     private var backgroundURL: URL?
     private var backgroundOpacity: CGFloat = 1
+    private var autoSaveSwitch: NSSwitch!
+    private var autoSaveEnabled = false
+    private var autoSaveWork: DispatchWorkItem?
+    private var hasPushedToNotes = false
 
     convenience init() {
         let window = NSWindow(
@@ -156,6 +160,8 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
     private func buildViews() {
         guard let content = window?.contentView else { return }
 
+        autoSaveEnabled = UserDefaults.standard.bool(forKey: Self.defaultKeyAutoSave)
+
         // 窗口级背景图：先加入即位于最底层，覆盖编辑区与预览区；不改动窗口 frame，
         // 因此添加背景图不会改变窗口大小与比例
         windowBackground = BackgroundImageView()
@@ -167,14 +173,12 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         let bottomBar = NSView(frame: NSRect(x: 0, y: 0, width: content.bounds.width, height: 48))
         bottomBar.autoresizingMask = [.width]
 
-        let createButton = makeButton("新建备忘录", action: #selector(createNote))
-        createButton.keyEquivalent = "r"
-        let openFileButton = makeButton("打开文件", action: #selector(openDocument))
+        let newButton = makeButton("新建", action: #selector(newDocument))
+        let openFileButton = makeButton("打开", action: #selector(openDocument))
         let saveButton = makeButton("保存", action: #selector(saveDocumentAction))
-        let pasteButton = makeButton("粘贴到当前备忘录", action: #selector(pasteToNotes))
-        pasteButton.keyEquivalent = "v"
-        pasteButton.keyEquivalentModifierMask = [.command, .shift]
-        let copyButton = makeButton("复制富文本", action: #selector(copyRich))
+        let noteButton = makeButton("新建备忘录并粘贴", action: #selector(createNoteAndPaste))
+        noteButton.keyEquivalent = "r"
+        let copyButton = makeButton("复制为富文本", action: #selector(copyRich))
         copyButton.keyEquivalent = "c"
         copyButton.keyEquivalentModifierMask = [.command, .shift]
 
@@ -183,7 +187,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
 
-        let bar = NSStackView(views: [createButton, openFileButton, saveButton, pasteButton, copyButton, statusLabel])
+        let bar = NSStackView(views: [newButton, openFileButton, saveButton, noteButton, copyButton, statusLabel])
         bar.orientation = .horizontal
         bar.spacing = 10
         bar.translatesAutoresizingMaskIntoConstraints = false
@@ -211,14 +215,29 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         topBar.addSubview(titleField)
         titleHint.translatesAutoresizingMaskIntoConstraints = false
         titleField.translatesAutoresizingMaskIntoConstraints = false
+        let titleWidth = titleField.widthAnchor.constraint(equalToConstant: 320)
+        titleWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
             titleHint.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 14),
             titleHint.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
             titleField.leadingAnchor.constraint(equalTo: titleHint.trailingAnchor, constant: 8),
             titleField.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
-            titleField.widthAnchor.constraint(equalToConstant: 320)
+            titleWidth,
+            titleField.widthAnchor.constraint(greaterThanOrEqualToConstant: 120)
         ])
-        // 顶栏右侧：背景图片 + 透明度
+        // 顶栏右侧：自动保存 + 背景图片 + 透明度
+        let autoSaveHint = NSTextField(labelWithString: "自动保存")
+        autoSaveHint.font = NSFont.systemFont(ofSize: 11)
+        autoSaveHint.textColor = .secondaryLabelColor
+        autoSaveSwitch = NSSwitch()
+        autoSaveSwitch.state = autoSaveEnabled ? .on : .off
+        autoSaveSwitch.target = self
+        autoSaveSwitch.action = #selector(toggleAutoSave(_:))
+        autoSaveSwitch.toolTip = "开启后：打开文件时，停顿 0.6 秒自动保存该文件"
+        let sep = NSBox()
+        sep.boxType = .separator
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.heightAnchor.constraint(equalToConstant: 18).isActive = true
         let bgButton = makeButton("背景图片…", action: #selector(pickBackgroundImage))
         bgButton.controlSize = .small
         bgClearButton = makeButton("清除背景", action: #selector(clearBackgroundImage))
@@ -230,7 +249,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
                                  target: self, action: #selector(opacitySliderChanged(_:)))
         opacitySlider.controlSize = .small
         opacitySlider.toolTip = "背景图片不透明度"
-        let rightStack = NSStackView(views: [opacityHint, opacitySlider, bgButton, bgClearButton])
+        let rightStack = NSStackView(views: [autoSaveHint, autoSaveSwitch, sep, opacityHint, opacitySlider, bgButton, bgClearButton])
         rightStack.orientation = .horizontal
         rightStack.spacing = 8
         rightStack.translatesAutoresizingMaskIntoConstraints = false
@@ -321,16 +340,37 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
     func textDidChange(_ notification: Notification) {
         if !isProgrammaticChange {
             isDirty = true
+            hasPushedToNotes = false
             updateTitle()
         }
         updateWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.refreshPreview() }
         updateWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+
+        // 自动保存：文件已打开且停止输入 0.6 秒后静默保存
+        if autoSaveEnabled {
+            autoSaveWork?.cancel()
+            let saveWork = DispatchWorkItem { [weak self] in
+                guard let self, self.autoSaveEnabled, self.isDirty, let url = self.fileURL else { return }
+                _ = self.save(to: url)
+            }
+            autoSaveWork = saveWork
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: saveWork)
+        }
+    }
+
+    @objc func toggleAutoSave(_ sender: NSSwitch) {
+        autoSaveEnabled = sender.state == .on
+        UserDefaults.standard.set(autoSaveEnabled, forKey: Self.defaultKeyAutoSave)
+        if !autoSaveEnabled {
+            autoSaveWork?.cancel()
+        }
     }
 
     private func refreshPreview() {
-        let width = max(previewTextView.bounds.width - 24, 120)
+        // 窗口未布局完成时兜底 320，避免首帧表格被过度压缩
+        let width = max(previewTextView.bounds.width - 24, 320)
         previewTextView.textStorage?.setAttributedString(
             MarkdownRenderer.render(editorTextView.string, contentWidth: width) { [weak self] in
                 // 图床图片下载完成：重渲染（命中缓存，不再下载）
@@ -355,10 +395,11 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         window?.title = fileURL.map { "NotesMD - \($0.lastPathComponent)" } ?? "NotesMD"
     }
 
-    func newDocument() {
+    @objc func newDocument() {
         guard confirmDiscardIfDirty() else { return }
         fileURL = nil
         isDirty = false
+        hasPushedToNotes = false
         isProgrammaticChange = true
         titleField.stringValue = ""
         editorTextView.string = ""
@@ -384,6 +425,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         }
         fileURL = url
         isDirty = false
+        hasPushedToNotes = false
         isProgrammaticChange = true
         titleField.stringValue = ""
         editorTextView.string = text
@@ -435,17 +477,26 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        guard isDirty else { return true }
+        let hasContent = !editorTextView.string
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard hasContent && (isDirty || !hasPushedToNotes) else { return true }
+
+        var pending: [String] = []
+        if isDirty { pending.append("尚未保存为 Markdown 文件") }
+        if !hasPushedToNotes { pending.append("尚未新建备忘录并粘贴") }
         let alert = NSAlert()
-        alert.messageText = "有未保存的更改"
-        alert.informativeText = "是否保存对 \(fileURL?.lastPathComponent ?? "当前文件") 的更改？"
-        alert.addButton(withTitle: "保存")
-        alert.addButton(withTitle: "不保存")
+        alert.messageText = "内容还没有处理完"
+        alert.informativeText = "当前：" + pending.joined(separator: "；") + "。\n请选择关闭前如何处理："
+        alert.addButton(withTitle: fileURL == nil ? "另存为并关闭" : "保存并关闭")
+        alert.addButton(withTitle: "新建备忘录并粘贴，然后关闭")
+        alert.addButton(withTitle: "不处理直接关闭")
         alert.addButton(withTitle: "取消")
         switch alert.runModal() {
         case .alertFirstButtonReturn:
             return saveDocument()
         case .alertSecondButtonReturn:
+            return pushNowToNotes()
+        case .alertThirdButtonReturn:
             return true
         default:
             return false
@@ -462,7 +513,10 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         return MarkdownRenderer.noteMarkdown(editorTextView.string, explicitTitle: explicit)
     }
 
-    @objc func createNote() {
+    /// 新建备忘录并粘贴：AppleScript 创建带完整内容的备忘录（首行为加粗标题），
+    /// 同时把富文本复制进剪贴板，方便再 ⌘V 到其他笔记
+    @objc func createNoteAndPaste() {
+        NotesService.copyRich(markdown: noteTitleMarkdown)
         let md = noteTitleMarkdown
         let html = MarkdownRenderer.html(from: md)
         let title = MarkdownRenderer.deriveTitle(from: md) ?? "未命名备忘录"
@@ -472,18 +526,27 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
             DispatchQueue.main.async {
                 switch result {
                 case .success:
-                    self.setStatus("已创建备忘录「\(title)」")
+                    self.hasPushedToNotes = true
+                    self.setStatus("已创建备忘录「\(title)」，富文本也已复制到剪贴板")
                 case .failure(let error):
-                    self.setStatus("创建失败：\(error.localizedDescription)")
+                    self.setStatus("创建失败：\(error.localizedDescription)（富文本已在剪贴板，可手动 ⌘V）")
                 }
             }
         }
     }
 
-    @objc func pasteToNotes() {
-        NotesService.copyRich(markdown: noteTitleMarkdown)
-        NotesService.pasteIntoNotes()
-        setStatus("已复制并尝试粘贴到备忘录（若未生效，请在备忘录中按 ⌘V）")
+    /// 同步写入备忘录（关闭确认弹窗用；osascript 约 1 秒）
+    @discardableResult
+    private func pushNowToNotes() -> Bool {
+        let result = NotesService.createNote(html: MarkdownRenderer.html(from: noteTitleMarkdown))
+        if case .success = result {
+            hasPushedToNotes = true
+            return true
+        }
+        if case .failure(let error) = result {
+            setStatus("创建失败：\(error.localizedDescription)")
+        }
+        return false
     }
 
     @objc func copyRich() {
@@ -493,6 +556,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
 
     // MARK: - 背景图片
 
+    private static let defaultKeyAutoSave = "notesmd.autosave"
     private static let defaultKeyBgURL = "notesmd.backgroundURL"
     private static let defaultKeyBgAlpha = "notesmd.backgroundOpacity"
 
@@ -553,6 +617,21 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
             windowBackground.imageAlpha = backgroundOpacity
         }
     }
+
+    var isDirtyForTest: Bool { isDirty }
+
+    func setAutoSaveForTesting(_ on: Bool) {
+        autoSaveEnabled = on
+        autoSaveSwitch.state = on ? .on : .off
+    }
+
+    func simulateUserEdit(append text: String) {
+        isProgrammaticChange = true
+        editorTextView.string = editorTextView.string + text
+        isProgrammaticChange = false
+        textDidChange(Notification(name: NSText.didChangeNotification, object: editorTextView))
+    }
+    var filePathForTest: String? { fileURL?.path }
 
     func setTextForTesting(_ s: String) {
         isProgrammaticChange = true
@@ -628,9 +707,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
         for item in [
-            NSMenuItem(title: "新建备忘录", action: #selector(editorCreateNote), keyEquivalent: ""),
-            NSMenuItem(title: "粘贴到当前备忘录", action: #selector(editorPasteToNotes), keyEquivalent: ""),
-            NSMenuItem(title: "复制富文本", action: #selector(editorCopyRich), keyEquivalent: ""),
+            NSMenuItem(title: "新建备忘录并粘贴", action: #selector(editorCreateNoteAndPaste), keyEquivalent: ""),
+            NSMenuItem(title: "复制为富文本", action: #selector(editorCopyRich), keyEquivalent: ""),
             NSMenuItem(title: "背景图片…", action: #selector(editorPickBackground), keyEquivalent: ""),
             NSMenuItem(title: "清除背景图片", action: #selector(editorClearBackground), keyEquivalent: "")
         ] {
@@ -693,14 +771,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         defaultApp.target = self
         fileMenu.addItem(defaultApp)
         fileMenu.addItem(.separator())
-        let newItem = NSMenuItem(title: "新建备忘录", action: #selector(editorCreateNote), keyEquivalent: "r")
-        newItem.target = self
-        fileMenu.addItem(newItem)
-        let pasteItem = NSMenuItem(title: "粘贴到当前备忘录", action: #selector(editorPasteToNotes), keyEquivalent: "V")
-        pasteItem.target = self
-        pasteItem.keyEquivalentModifierMask = [.command, .shift]
-        fileMenu.addItem(pasteItem)
-        let copyItem = NSMenuItem(title: "复制富文本", action: #selector(editorCopyRich), keyEquivalent: "C")
+        let noteItem = NSMenuItem(title: "新建备忘录并粘贴", action: #selector(editorCreateNoteAndPaste), keyEquivalent: "r")
+        noteItem.target = self
+        fileMenu.addItem(noteItem)
+        let copyItem = NSMenuItem(title: "复制为富文本", action: #selector(editorCopyRich), keyEquivalent: "C")
         copyItem.target = self
         copyItem.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(copyItem)
@@ -739,7 +813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func editorOpenDocument() { editor?.openDocument() }
     @objc func editorSaveDocument() { _ = editor?.saveDocument() }
     @objc func editorSaveDocumentAs() { _ = editor?.saveDocumentAs() }
-    @objc func editorCreateNote() { editor?.createNote() }
+    @objc func editorCreateNoteAndPaste() { editor?.createNoteAndPaste() }
 
     @objc func setDefaultMarkdownApp() {
         guard let bundleID = Bundle.main.bundleIdentifier else { return }
@@ -759,7 +833,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         alert.runModal()
     }
-    @objc func editorPasteToNotes() { editor?.pasteToNotes() }
     @objc func editorCopyRich() { editor?.copyRich() }
     @objc func editorPickBackground() { editor?.pickBackgroundImage() }
     @objc func editorClearBackground() { editor?.clearBackgroundImage() }
@@ -797,7 +870,8 @@ func runCLI() -> Bool {
         wc.window?.makeKeyAndOrderFront(nil)
         wc.setTextForTesting(md)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            wc.pasteToNotes()
+            NotesService.copyRich(markdown: wc.noteTitleMarkdown)
+            NotesService.pasteIntoNotes()
         }
         Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { _ in
             NSApp.terminate(nil)
@@ -852,6 +926,64 @@ func runCLI() -> Bool {
                     }
                 }
             }
+            NSApp.terminate(nil)
+        }
+        app2.run()
+        return true
+    }
+    if let idx = args.firstIndex(of: "--close-test"), idx + 1 < args.count {
+        let path = args[idx + 1]
+        let outPath = (idx + 2 < args.count) ? args[idx + 2] : "/tmp/nmd-test/close-test.png"
+        let app2 = NSApplication.shared
+        app2.setActivationPolicy(.accessory)
+        let wc = EditorWindowController()
+        wc.window?.makeKeyAndOrderFront(nil)
+        wc.loadFile(URL(fileURLWithPath: path))
+        if ProcessInfo.processInfo.environment["NMD_EDIT"] == "1" {
+            wc.simulateUserEdit(append: "\n\n自动保存测试\n")
+        }
+        FileHandle.standardError.write(Data("LOADED: \(wc.filePathForTest ?? "nil") dirty=\(wc.isDirtyForTest)\n".utf8))
+        guard let win = wc.window else { FileHandle.standardError.write(Data("NO WIN\n".utf8)); app2.run(); return true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            win.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            win.performClose(nil)
+        }
+        // 模态弹窗会阻塞默认 runloop 模式，用 common 模式定时器截图并退出
+        let timer = Timer(timeInterval: 2.5, repeats: false) { _ in
+            var panelRep: NSBitmapImageRep?
+            FileHandle.standardError.write(Data("CAPTURE: editorText=\(wc.editorTextView.string.count) wcWindowVisible=\(wc.window?.isVisible ?? false)\n".utf8))
+            for w in NSApp.windows {
+                guard w.isVisible, w != wc.window, let cv = w.contentView else { continue }
+                guard let rep = cv.bitmapImageRepForCachingDisplay(in: cv.bounds) else { continue }
+                cv.cacheDisplay(in: cv.bounds, to: rep)
+                panelRep = rep
+                FileHandle.standardError.write(Data("PANEL: \(String(describing: type(of: w))) frame=\(w.frame)\n".utf8))
+            }
+            if let png = panelRep?.representation(using: .png, properties: [:]) {
+                try? png.write(to: URL(fileURLWithPath: outPath))
+            }
+            NSApp.terminate(nil)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        app2.run()
+        return true
+    }
+    if let idx = args.firstIndex(of: "--autosave-test"), idx + 1 < args.count {
+        let path = args[idx + 1]
+        let app2 = NSApplication.shared
+        app2.setActivationPolicy(.accessory)
+        let wc = EditorWindowController()
+        wc.window?.makeKeyAndOrderFront(nil)
+        wc.loadFile(URL(fileURLWithPath: path))
+        wc.setAutoSaveForTesting(true)
+        FileHandle.standardError.write(Data("AUTOSAVE: before tail=\((try? String(contentsOfFile: path, encoding: .utf8))?.suffix(20) ?? "nil") dirty=\(wc.isDirtyForTest)\n".utf8))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            wc.simulateUserEdit(append: "\n\n自动保存测试\n")
+        }
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { _ in
+            let tail = (try? String(contentsOfFile: path, encoding: .utf8))?.suffix(20) ?? "读取失败"
+            FileHandle.standardError.write(Data("AUTOSAVE: after tail=\(tail)\n".utf8))
             NSApp.terminate(nil)
         }
         app2.run()

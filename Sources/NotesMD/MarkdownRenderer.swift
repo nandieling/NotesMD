@@ -9,112 +9,74 @@ enum MarkdownRenderer {
     // MARK: - Block level
 
     static func html(from markdown: String) -> String {
-        var out: [String] = []
-        let lines = markdown
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .components(separatedBy: "\n")
-
-        var paragraph: [String] = []
-        var i = 0
-
-        func flushParagraph() {
-            guard !paragraph.isEmpty else { return }
-            out.append("<p>" + paragraph.map(inline).joined(separator: "<br>") + "</p>")
-            paragraph = []
-        }
-
-        while i < lines.count {
-            let line = lines[i]
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-
-            // 围栏代码块
-            if trimmed.hasPrefix("```") {
-                flushParagraph()
-                var code: [String] = []
-                i += 1
-                while i < lines.count &&
-                    !lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("```") {
-                    code.append(lines[i])
-                    i += 1
-                }
-                if i < lines.count { i += 1 } // 跳过收尾围栏
-                out.append("<pre><code>" + code.map(escape).joined(separator: "\n") + "</code></pre>")
-                continue
-            }
-
-            // 标题
-            if let m = match(#"^(#{1,6})\s+(.+?)\s*#*\s*$"#, line) {
-                flushParagraph()
-                let level = m[0].count
-                out.append("<h\(level)>" + inline(m[1]) + "</h\(level)>")
-                i += 1
-                continue
-            }
-
-            // 水平线
-            if isHorizontalRule(trimmed) {
-                flushParagraph()
-                out.append("<hr>")
-                i += 1
-                continue
-            }
-
-            // 引用
-            if trimmed.hasPrefix(">") {
-                flushParagraph()
-                var quote: [String] = []
-                while i < lines.count {
-                    let t = lines[i].trimmingCharacters(in: .whitespaces)
-                    guard t.hasPrefix(">") else { break }
-                    quote.append(String(t.dropFirst()).trimmingCharacters(in: .whitespaces))
-                    i += 1
-                }
-                out.append("<blockquote>" + quote.map(inline).joined(separator: "<br>") + "</blockquote>")
-                continue
-            }
-
-            // 无序列表
-            if isUnorderedItem(line) {
-                flushParagraph()
-                var items: [String] = []
-                while i < lines.count && isUnorderedItem(lines[i]) {
-                    items.append(listContent(lines[i]))
-                    i += 1
-                }
-                out.append("<ul>" + items.map { "<li>" + inline($0) + "</li>" }.joined() + "</ul>")
-                continue
-            }
-
-            // 有序列表
-            if isOrderedItem(line) {
-                flushParagraph()
-                var items: [String] = []
-                while i < lines.count && isOrderedItem(lines[i]) {
-                    items.append(listContent(lines[i]))
-                    i += 1
-                }
-                out.append("<ol>" + items.map { "<li>" + inline($0) + "</li>" }.joined() + "</ol>")
-                continue
-            }
-
-            if trimmed.isEmpty {
-                flushParagraph()
-                i += 1
-                continue
-            }
-
-            paragraph.append(line)
-            i += 1
-        }
-        flushParagraph()
+        let blocks = MDParser.blocks(from: markdown)
         // 块之间插入空行，备忘录里保留段落间距
-        return out.joined(separator: "<div><br></div>")
+        return blocks.map(htmlBlock).joined(separator: "<div><br></div>")
     }
 
-    // MARK: - Inline
+    private static func htmlBlock(_ b: MDBlock) -> String {
+        switch b {
+        case .heading(let level, let text):
+            return "<h\(level)>" + inline(text) + "</h\(level)>"
+        case .paragraph(let lines):
+            return "<p>" + lines.map(inline).joined(separator: "<br>") + "</p>"
+        case .code(_, let code):
+            return "<pre><code>" + code.map(escape).joined(separator: "\\n") + "</code></pre>"
+        case .quote(let blocks):
+            return "<blockquote>" + blocks.map(htmlBlock).joined(separator: "<br>") + "</blockquote>"
+        case .list(let list):
+            return htmlList(list)
+        case .table(let table):
+            return htmlTable(table)
+        case .hr:
+            return "<hr>"
+        }
+    }
+
+    private static func htmlList(_ list: MDList) -> String {
+        let tag = list.ordered ? "ol" : "ul"
+        let startAttr = (list.ordered && list.start != 1) ? " start=\"\(list.start)\"" : ""
+        var out = "<\(tag)\(startAttr)>"
+        for item in list.items {
+            var content = ""
+            if let task = item.task {
+                content += task == 1 ? "☑ " : "☐ "
+            }
+            content += item.text.map(inline).joined(separator: "<br>")
+            content += item.children.map(htmlList).joined()
+            out += "<li>" + content + "</li>"
+        }
+        out += "</\(tag)>"
+        return out
+    }
+
+    private static func htmlTable(_ table: MDTable) -> String {
+        func alignAttr(_ i: Int) -> String {
+            guard i < table.aligns.count else { return "" }
+            switch table.aligns[i] {
+            case 1: return " align=\"left\""
+            case 2: return " align=\"center\""
+            case 3: return " align=\"right\""
+            default: return ""
+            }
+        }
+        var out = "<table border=\"0\" cellpadding=\"4\" cellspacing=\"0\">"
+        out += "<tr>" + table.header.enumerated()
+            .map { "<th\(alignAttr($0.offset))>\(inline($0.element))</th>" }.joined() + "</tr>"
+        for row in table.rows {
+            out += "<tr>"
+            for (ci, cell) in row.enumerated() {
+                out += "<td\(alignAttr(ci))>\(inline(cell))</td>"
+            }
+            out += "</tr>"
+        }
+        out += "</table>"
+        return out
+    }
+
+// MARK: - Inline
 
     static func inline(_ raw: String) -> String {
-        var s = escape(raw)
         var stash: [String] = []
 
         func stashHTML(_ html: String) -> String {
@@ -122,6 +84,16 @@ enum MarkdownRenderer {
             return "\u{1}\(stash.count - 1)\u{1}"
         }
 
+        // 自动链接 <https://...>（须在 escape 之前，避免 < > 变成 &lt; &gt;）
+        var s = replaceRegex(#"<((?:https?|ftp)://[^<>\s]+)>"#, in: raw) { m in
+            let url = (raw as NSString).substring(with: m.range(at: 1))
+            return stashHTML("<a href=\"\(url)\">\(url)</a>")
+        }
+        s = escape(s)
+        // 反斜杠转义：\\* \\` \\[ 等还原为普通字符（先保护，避免被再加格式）
+        s = replaceRegex(#"(\\)([\\`*_{}\[\]()#+.!>~-])"#, in: s) { m in
+            stashHTML(s.substring(m.range(at: 2)))
+        }
         // 行内代码（先保护，避免内部被再加格式）
         s = replaceRegex(#"`([^`]+)`"#, in: s) { m in
             stashHTML("<code>" + s.substring(m.range(at: 1)) + "</code>")
