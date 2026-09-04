@@ -52,6 +52,13 @@ enum Sample {
     func hello() -> String { "你好" }
     ```
 
+    ## 表格（带框线）
+    | 功能 | 快捷键 | 说明 |
+    | --- | :---: | ---: |
+    | 新建备忘录并粘贴 | ⌘R | 创建并关联 |
+    | **更新备忘录** | — | 写入关联的笔记 |
+    | 转义竖线 | \\| 不切分列 | 列对齐 |
+
     ## 三种用法
     1. 新建备忘录并粘贴：生成一条原生排版的备忘录，富文本同时进剪贴板
     2. 复制为富文本：自行选择粘贴位置
@@ -141,6 +148,17 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
     private var autoSaveWork: DispatchWorkItem?
     private var hasPushedToNotes = false
 
+    // 图床（pixhost）
+    private var pixUploadButton: NSButton!
+    private var pixHistoryButton: NSButton!
+    private var pixHistoryWC: PixHistoryWindowController?
+    private var pixResultSheet: PixResultSheet?
+    // 备忘录关联（关联修改）
+    private var updateNoteButton: NSButton!
+    private var pickNoteButton: NSButton!
+    private var notePickerWC: NotePickerWindowController?
+    private var boundNoteName: String? = NoteBinding.name
+
     convenience init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 880, height: 580),
@@ -178,6 +196,8 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         let saveButton = makeButton("保存", action: #selector(saveDocumentAction))
         let noteButton = makeButton("新建备忘录并粘贴", action: #selector(createNoteAndPaste))
         noteButton.keyEquivalent = "r"
+        updateNoteButton = makeButton("更新备忘录", action: #selector(updateBoundNote))
+        pickNoteButton = makeButton("选择备忘录…", action: #selector(pickNoteToBind))
         let copyButton = makeButton("复制为富文本", action: #selector(copyRich))
         copyButton.keyEquivalent = "c"
         copyButton.keyEquivalentModifierMask = [.command, .shift]
@@ -187,7 +207,8 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
 
-        let bar = NSStackView(views: [newButton, openFileButton, saveButton, noteButton, copyButton, statusLabel])
+        let bar = NSStackView(views: [newButton, openFileButton, saveButton, noteButton,
+                                      updateNoteButton, pickNoteButton, copyButton, statusLabel])
         bar.orientation = .horizontal
         bar.spacing = 10
         bar.translatesAutoresizingMaskIntoConstraints = false
@@ -249,7 +270,16 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
                                  target: self, action: #selector(opacitySliderChanged(_:)))
         opacitySlider.controlSize = .small
         opacitySlider.toolTip = "背景图片不透明度"
-        let rightStack = NSStackView(views: [autoSaveHint, autoSaveSwitch, sep, opacityHint, opacitySlider, bgButton, bgClearButton])
+        let sep2 = NSBox()
+        sep2.boxType = .separator
+        sep2.translatesAutoresizingMaskIntoConstraints = false
+        sep2.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        pixUploadButton = iconTopButton("photo.badge.plus", action: #selector(uploadImagesToPixhost),
+                                        title: "上传图床", tooltip: "上传图片到 pixhost 图床，可复制原图链接")
+        pixHistoryButton = iconTopButton("photo.stack", action: #selector(showPixHistory),
+                                         title: "历史图片", tooltip: "查看之前上传的所有图片")
+        let rightStack = NSStackView(views: [autoSaveHint, autoSaveSwitch, sep, opacityHint, opacitySlider,
+                                             bgButton, bgClearButton, sep2, pixUploadButton, pixHistoryButton])
         rightStack.orientation = .horizontal
         rightStack.spacing = 8
         rightStack.translatesAutoresizingMaskIntoConstraints = false
@@ -295,6 +325,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         refreshPreview()
         restoreBackground()
         updateBackgroundControls()
+        updateNoteBindingsUI()
     }
 
     private func makeScroll() -> NSScrollView {
@@ -332,6 +363,18 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         let b = NSButton(title: title, target: self, action: action)
         b.bezelStyle = .rounded
         b.controlSize = .regular
+        return b
+    }
+
+    private func iconTopButton(_ symbol: String, action: Selector, title: String, tooltip: String) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        b.controlSize = .small
+        b.toolTip = tooltip
+        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: title) {
+            b.image = img
+            b.imagePosition = .imageLeading
+        }
         return b
     }
 
@@ -483,7 +526,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
 
         var pending: [String] = []
         if isDirty { pending.append("尚未保存为 Markdown 文件") }
-        if !hasPushedToNotes { pending.append("尚未新建备忘录并粘贴") }
+        if !hasPushedToNotes { pending.append("尚未写入备忘录（新建/更新）") }
         let alert = NSAlert()
         alert.messageText = "内容还没有处理完"
         alert.informativeText = "当前：" + pending.joined(separator: "；") + "。\n请选择关闭前如何处理："
@@ -525,9 +568,10 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
             let result = NotesService.createNote(html: html)
             DispatchQueue.main.async {
                 switch result {
-                case .success:
+                case .success(let noteID):
                     self.hasPushedToNotes = true
-                    self.setStatus("已创建备忘录「\(title)」，富文本也已复制到剪贴板")
+                    self.bindNote(id: noteID, name: title, silent: true)
+                    self.setStatus("已创建并关联备忘录「\(title)」，富文本也已复制到剪贴板")
                 case .failure(let error):
                     self.setStatus("创建失败：\(error.localizedDescription)（富文本已在剪贴板，可手动 ⌘V）")
                 }
@@ -535,23 +579,187 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         }
     }
 
-    /// 同步写入备忘录（关闭确认弹窗用；osascript 约 1 秒）
+    /// 同步写入备忘录（关闭确认弹窗用；osascript 约 1 秒）。
+    /// 已关联笔记时直接更新该笔记，否则新建一条并自动关联。
     @discardableResult
     private func pushNowToNotes() -> Bool {
-        let result = NotesService.createNote(html: MarkdownRenderer.html(from: noteTitleMarkdown))
-        if case .success = result {
+        let md = noteTitleMarkdown
+        let html = MarkdownRenderer.html(from: md)
+        if let id = NoteBinding.id {
+            switch NotesService.updateNote(id: id, html: html) {
+            case .success:
+                hasPushedToNotes = true
+                return true
+            case .failure(let error):
+                unbindNote(silent: true)
+                setStatus("更新失败：\(error.localizedDescription)")
+                return false
+            }
+        }
+        switch NotesService.createNote(html: html) {
+        case .success(let id):
             hasPushedToNotes = true
+            let title = MarkdownRenderer.deriveTitle(from: md) ?? "未命名备忘录"
+            bindNote(id: id, name: title, silent: true)
             return true
-        }
-        if case .failure(let error) = result {
+        case .failure(let error):
             setStatus("创建失败：\(error.localizedDescription)")
+            return false
         }
-        return false
     }
 
     @objc func copyRich() {
         NotesService.copyRich(markdown: noteTitleMarkdown)
         setStatus("已复制富文本，到备忘录中按 ⌘V 粘贴")
+    }
+
+    // MARK: - 备忘录关联（关联修改）
+
+    /// 把当前内容写入关联的备忘录；未关联时引导先选择一条笔记
+    @objc func updateBoundNote() {
+        let md = noteTitleMarkdown
+        guard !md.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            setStatus("内容为空，没有可写入的正文")
+            return
+        }
+        guard let id = NoteBinding.id else {
+            let alert = NSAlert()
+            alert.messageText = "尚未关联备忘录"
+            alert.informativeText = "先选择一条已有备忘录进行关联，之后即可随时把当前内容更新进去（也可先「新建备忘录并粘贴」，会自动关联）。"
+            alert.addButton(withTitle: "选择备忘录…")
+            alert.addButton(withTitle: "取消")
+            if alert.runModal() == .alertFirstButtonReturn {
+                pickNoteToBind()
+            }
+            return
+        }
+        let title = MarkdownRenderer.deriveTitle(from: md) ?? (boundNoteName ?? "未命名备忘录")
+        let html = MarkdownRenderer.html(from: md)
+        setStatus("正在更新备忘录「\(boundNoteName ?? "")」…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = NotesService.updateNote(id: id, html: html)
+            DispatchQueue.main.async {
+                switch result {
+                case .success:
+                    self.hasPushedToNotes = true
+                    self.setStatus("已更新备忘录「\(title)」")
+                case .failure(let error):
+                    self.unbindNote()
+                    self.setStatus("更新失败：\(error.localizedDescription)（已解除关联，可重新选择）")
+                }
+            }
+        }
+    }
+
+    /// 打开笔记选择窗口，关联一条已有备忘录
+    @objc func pickNoteToBind() {
+        if notePickerWC == nil {
+            let wc = NotePickerWindowController()
+            wc.onPick = { [weak self] id, name in
+                guard let self else { return }
+                self.bindNote(id: id, name: name, silent: false)
+                self.hasPushedToNotes = false
+            }
+            notePickerWC = wc
+        }
+        notePickerWC?.showWindowAndLoad()
+    }
+
+    func bindNote(id: String, name: String, silent: Bool) {
+        NoteBinding.bind(id: id, name: name)
+        boundNoteName = name
+        updateNoteBindingsUI()
+        if !silent {
+            setStatus("已关联备忘录「\(name)」，点「更新备忘录」即可写入")
+        }
+    }
+
+    @objc func unbindNote() {
+        unbindNote(silent: false)
+    }
+
+    private func unbindNote(silent: Bool) {
+        NoteBinding.unbind()
+        boundNoteName = nil
+        updateNoteBindingsUI()
+        if !silent {
+            setStatus("已解除关联")
+        }
+    }
+
+    private func updateNoteBindingsUI() {
+        if let name = NoteBinding.name {
+            pickNoteButton.title = "更换备忘录…"
+            updateNoteButton.isEnabled = true
+            updateNoteButton.toolTip = "把当前内容写入关联的备忘录「\(name)」"
+        } else {
+            pickNoteButton.title = "选择备忘录…"
+            updateNoteButton.isEnabled = true
+            updateNoteButton.toolTip = "尚未关联备忘录：点「选择备忘录…」关联一条已有笔记，或先「新建备忘录并粘贴」"
+        }
+    }
+
+    // MARK: - pixhost 图床
+
+    @objc func uploadImagesToPixhost() {
+        let panel = NSOpenPanel()
+        panel.title = "选择要上传到 pixhost 的图片"
+        panel.allowedContentTypes = [UTType.image]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        guard !urls.isEmpty else { return }
+        pixUploadButton.isEnabled = false
+        var results: [Result<PixImage, Error>] = []
+        var idx = 0
+        func step() {
+            guard idx < urls.count else {
+                pixUploadButton.isEnabled = true
+                self.showPixResult(results)
+                return
+            }
+            let url = urls[idx]
+            PixhostAPI.upload(fileURL: url) { [weak self] result in
+                results.append(result)
+                if case .success(let img) = result { PixHistory.add(img) }
+                idx += 1
+                self?.setStatus("正在上传到 pixhost（\(idx)/\(urls.count)）…")
+                step()
+            }
+        }
+        step()
+    }
+
+    private func showPixResult(_ results: [Result<PixImage, Error>]) {
+        let okCount = results.filter {
+            if case .success = $0 { return true } else { return false }
+        }.count
+        if okCount > 0 {
+            setStatus("已上传 \(okCount) 张图片到 pixhost")
+        }
+        guard let window else { return }
+        let sheetObj = PixResultSheet(results: results) { [weak self] text in
+            guard let self else { return }
+            self.editorTextView.insertText(text, replacementRange: self.editorTextView.selectedRange())
+        }
+        let sheetView = sheetObj.makeView()
+        let sheetWin = NSWindow(contentRect: sheetView.frame, styleMask: [.titled],
+                                backing: .buffered, defer: false)
+        sheetWin.contentView = sheetView
+        pixResultSheet = sheetObj
+        window.beginSheet(sheetWin) { [weak self] _ in
+            self?.pixResultSheet = nil
+        }
+    }
+
+    @objc func showPixHistory() {
+        if pixHistoryWC == nil {
+            let wc = PixHistoryWindowController()
+            wc.window?.center()
+            pixHistoryWC = wc
+        }
+        pixHistoryWC?.showWindowAndReload()
     }
 
     // MARK: - 背景图片
@@ -708,7 +916,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         for item in [
             NSMenuItem(title: "新建备忘录并粘贴", action: #selector(editorCreateNoteAndPaste), keyEquivalent: ""),
-            NSMenuItem(title: "复制为富文本", action: #selector(editorCopyRich), keyEquivalent: ""),
+            NSMenuItem(title: "更新关联备忘录", action: #selector(editorUpdateBoundNote), keyEquivalent: ""),
+            NSMenuItem(title: "选择备忘录…", action: #selector(editorPickNote), keyEquivalent: ""),
+            NSMenuItem(title: "上传图片到 pixhost…", action: #selector(editorUploadPixhost), keyEquivalent: ""),
+            NSMenuItem(title: "pixhost 历史图片", action: #selector(editorShowPixHistory), keyEquivalent: ""),
             NSMenuItem(title: "背景图片…", action: #selector(editorPickBackground), keyEquivalent: ""),
             NSMenuItem(title: "清除背景图片", action: #selector(editorClearBackground), keyEquivalent: "")
         ] {
@@ -774,6 +985,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let noteItem = NSMenuItem(title: "新建备忘录并粘贴", action: #selector(editorCreateNoteAndPaste), keyEquivalent: "r")
         noteItem.target = self
         fileMenu.addItem(noteItem)
+        let updateItem = NSMenuItem(title: "更新关联备忘录", action: #selector(editorUpdateBoundNote), keyEquivalent: "U")
+        updateItem.target = self
+        updateItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(updateItem)
+        let pickItem = NSMenuItem(title: "选择备忘录…（关联修改）", action: #selector(editorPickNote), keyEquivalent: "")
+        pickItem.target = self
+        fileMenu.addItem(pickItem)
+        let unbindItem = NSMenuItem(title: "解除关联备忘录", action: #selector(editorUnbindNote), keyEquivalent: "")
+        unbindItem.target = self
+        fileMenu.addItem(unbindItem)
+        fileMenu.addItem(.separator())
+        let uploadItem = NSMenuItem(title: "上传图片到 pixhost…", action: #selector(editorUploadPixhost), keyEquivalent: "")
+        uploadItem.target = self
+        fileMenu.addItem(uploadItem)
+        let historyItem = NSMenuItem(title: "pixhost 历史图片", action: #selector(editorShowPixHistory), keyEquivalent: "")
+        historyItem.target = self
+        fileMenu.addItem(historyItem)
         let copyItem = NSMenuItem(title: "复制为富文本", action: #selector(editorCopyRich), keyEquivalent: "C")
         copyItem.target = self
         copyItem.keyEquivalentModifierMask = [.command, .shift]
@@ -834,6 +1062,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
     @objc func editorCopyRich() { editor?.copyRich() }
+    @objc func editorUpdateBoundNote() { editor?.updateBoundNote() }
+    @objc func editorPickNote() { editor?.pickNoteToBind() }
+    @objc func editorUnbindNote() { editor?.unbindNote() }
+    @objc func editorUploadPixhost() { editor?.uploadImagesToPixhost() }
+    @objc func editorShowPixHistory() { editor?.showPixHistory() }
     @objc func editorPickBackground() { editor?.pickBackgroundImage() }
     @objc func editorClearBackground() { editor?.clearBackgroundImage() }
     @objc func quit() { NSApp.terminate(nil) }
@@ -857,7 +1090,7 @@ func runCLI() -> Bool {
         print("render length=", attr.length)
         let r = NotesService.createNote(html: html)
         switch r {
-        case .success: print("createNote=OK")
+        case .success(let noteID): print("createNote=OK id=", noteID)
         case .failure(let e): print("createNote=ERR", e.localizedDescription)
         }
         return true
@@ -1008,6 +1241,138 @@ func runCLI() -> Bool {
                 print("divider0=", NSRect(x: split.bounds.width * 0.46, y: 0, width: split.dividerThickness, height: split.bounds.height))
                 print("previewTextLength=", wc.previewTextView.string.count)
                 print("previewFirst30=", wc.previewTextView.string.prefix(30))
+            }
+            NSApp.terminate(nil)
+        }
+        app2.run()
+        return true
+    }
+    if let idx = args.firstIndex(of: "--pixhost-upload"), idx + 1 < args.count {
+        // 调试/脚本：上传一张图片到 pixhost，打印链接信息并写入历史
+        let path = args[idx + 1]
+        let app2 = NSApplication.shared
+        app2.setActivationPolicy(.accessory)
+        var done = false
+        PixhostAPI.upload(fileURL: URL(fileURLWithPath: path)) { result in
+            switch result {
+            case .success(let img):
+                PixHistory.add(img)
+                print("direct=", img.direct)
+                print("show=", img.show)
+                print("thumb=", img.thumb)
+                print("manage=", img.manage ?? "nil")
+            case .failure(let e):
+                FileHandle.standardError.write(Data("upload failed: \(e.localizedDescription)\n".utf8))
+            }
+            done = true
+        }
+        let deadline = Date().addingTimeInterval(120)
+        while !done && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        }
+        return true
+    }
+    if let idx = args.firstIndex(of: "--note-update"), idx + 2 < args.count {
+        // 调试/脚本：把 markdown 文件内容更新进指定 id 的已有备忘录
+        let id = args[idx + 1]
+        let path = args[idx + 2]
+        guard let md = try? String(contentsOfFile: path, encoding: .utf8) else {
+            FileHandle.standardError.write(Data("读取文件失败\n".utf8))
+            return true
+        }
+        let html = MarkdownRenderer.html(from: md)
+        switch NotesService.updateNote(id: id, html: html) {
+        case .success: print("updateNote=OK")
+        case .failure(let e): print("updateNote=ERR", e.localizedDescription)
+        }
+        return true
+    }
+    if args.contains("--note-list") {
+        switch NotesService.listNotes() {
+        case .success(let notes):
+            print("notes=", notes.count)
+            for n in notes.prefix(10) { print(n.id, "|", n.name) }
+        case .failure(let e):
+            FileHandle.standardError.write(Data("listNotes=ERR \(e.localizedDescription)\n".utf8))
+        }
+        return true
+    }
+    if let idx = args.firstIndex(of: "--pix-result-sheet"), idx + 1 < args.count {
+        // 调试：用最近的历史记录渲染上传结果 sheet 成 PNG 后退出
+        let outPath = args[idx + 1]
+        let app2 = NSApplication.shared
+        app2.setActivationPolicy(.accessory)
+        let items = Array(PixHistory.load().prefix(3))
+            .map { Result.success($0) as Result<PixImage, Error> }
+        let sheetObj = PixResultSheet(results: items) { _ in }
+        let sheetView = sheetObj.makeView()
+        let win = NSWindow(contentRect: sheetView.frame, styleMask: [.titled],
+                           backing: .buffered, defer: false)
+        win.contentView = sheetView
+        win.center()
+        win.makeKeyAndOrderFront(nil)
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { _ in
+            if let content = win.contentView {
+                content.displayIfNeeded()
+                if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                    content.cacheDisplay(in: content.bounds, to: rep)
+                    if let png = rep.representation(using: .png, properties: [:]) {
+                        try? png.write(to: URL(fileURLWithPath: outPath))
+                    }
+                }
+            }
+            NSApp.terminate(nil)
+        }
+        app2.run()
+        return true
+    }
+    if args.contains("--note-picker") {
+        // 调试：打开笔记选择窗口；带参数时渲染成 PNG 后退出
+        let outPath = args.contains("--note-picker") ?
+            (args.first { !$0.hasPrefix("-") && $0.hasSuffix(".png") }) ?? "" : ""
+        let app2 = NSApplication.shared
+        app2.setActivationPolicy(.accessory)
+        let wc = NotePickerWindowController()
+        wc.showWindowAndLoad()
+        Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { _ in
+            if !outPath.isEmpty, let content = wc.window?.contentView {
+                content.displayIfNeeded()
+                if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                    content.cacheDisplay(in: content.bounds, to: rep)
+                    if let png = rep.representation(using: .png, properties: [:]) {
+                        try? png.write(to: URL(fileURLWithPath: outPath))
+                    }
+                }
+            }
+            NSApp.terminate(nil)
+        }
+        app2.run()
+        return true
+    }
+    if let idx = args.firstIndex(of: "--pixhistory") {
+        // 调试：打开历史图片窗口；带参数时把窗口渲染成 PNG 后退出
+        //   --pixhistory [out.png] [list|card]
+        let outPath = idx + 1 < args.count && !args[idx + 1].hasPrefix("list") && !args[idx + 1].hasPrefix("card")
+            ? args[idx + 1] : ""
+        let modeArg = args.dropFirst(idx + 1).first(where: { $0.hasPrefix("list") || $0.hasPrefix("card") })
+        let app2 = NSApplication.shared
+        app2.setActivationPolicy(.accessory)
+        let wc = PixHistoryWindowController()
+        wc.window?.center()
+        wc.showWindowAndReload()
+        if modeArg == "card" {
+            wc.setModeForTesting(.card)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        Timer.scheduledTimer(withTimeInterval: 6, repeats: false) { _ in
+            if !outPath.isEmpty, let content = wc.window?.contentView {
+                content.displayIfNeeded()
+                if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                    content.cacheDisplay(in: content.bounds, to: rep)
+                    if let png = rep.representation(using: .png, properties: [:]) {
+                        try? png.write(to: URL(fileURLWithPath: outPath))
+                    }
+                }
             }
             NSApp.terminate(nil)
         }

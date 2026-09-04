@@ -159,77 +159,151 @@ extension MarkdownRenderer {
 
     private static func renderTable(_ table: MDTable, into out: NSMutableAttributedString,
                                     quoteDepth: Int, contentWidth: CGFloat) {
-        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let rows = [table.header] + table.rows
-        let colCount = max(table.header.count, rows.map { $0.count }.max() ?? 1)
-
-        // 列宽：按最宽单元格计算（等宽字体下 CJK 记 2 个字符宽），超宽时整体压缩
-        var widths = [Int](repeating: 4, count: colCount)
-        for row in rows {
-            for (c, cell) in row.enumerated() where c < colCount {
-                widths[c] = max(widths[c], displayWidth(cell))
-            }
-        }
-        let budget = max(Int(contentWidth) / 7, colCount * 2)
-        if widths.reduce(0, +) + (colCount - 1) * 2 > budget {
-            let scale = Double(budget) / Double(widths.reduce(0, +) + (colCount - 1) * 2)
-            widths = widths.map { max(2, Int(Double($0) * scale)) }
-        }
-
-        let textColor = quoteDepth > 0 ? NSColor.secondaryLabelColor : NSColor.labelColor
+        guard contentWidth >= 80, !table.header.isEmpty else { return }
+        let img = makeTableImage(table: table, contentWidth: contentWidth, quoteDepth: quoteDepth)
+        let att = NSTextAttachment()
+        att.image = img
+        out.append(NSAttributedString(attachment: att))
         let p = NSMutableParagraphStyle()
-        p.paragraphSpacingBefore = 4
-        p.paragraphSpacing = 4
-        for (ri, row) in rows.enumerated() {
-            var cells: [String] = []
-            for c in 0..<colCount {
-                let raw = c < row.count ? row[c] : ""
-                cells.append(padCell(raw, to: widths[c]))
+        p.paragraphSpacingBefore = 6
+        p.paragraphSpacing = 10
+        out.append(NSAttributedString(string: "\n",
+                                       attributes: [.paragraphStyle: p, .font: NSFont.systemFont(ofSize: 12)]))
+    }
+
+    /// 把表格渲染成一张带完整框线的图片（表头加粗带底色、支持左/中/右对齐、自动换行），
+    /// 再以文本附件插入预览。纯文本流式排版画不出竖线，所以用离屏绘制。
+    static func makeTableImage(table: MDTable, contentWidth: CGFloat, quoteDepth: Int) -> NSImage {
+        let font = NSFont.systemFont(ofSize: 12)
+        let headFont = NSFont.boldSystemFont(ofSize: 12)
+        let textColor = quoteDepth > 0 ? NSColor.secondaryLabelColor : NSColor.labelColor
+        let colCount = max(table.header.count, table.rows.map { $0.count }.max() ?? 1)
+        guard colCount > 0 else { return NSImage(size: NSSize(width: 2, height: 2)) }
+        let rows = [table.header] + table.rows
+        let norm: [[String]] = rows.map { row in
+            var r = row
+            while r.count < colCount { r.append("") }
+            return Array(r.prefix(colCount))
+        }
+        let padX: CGFloat = 8, padY: CGFloat = 6
+
+        // 1) 列宽：按单元格单行自然宽度取列最大值，限制上限后整体压缩/拉伸到 contentWidth
+        var natural = [CGFloat](repeating: 24, count: colCount)
+        for (ri, row) in norm.enumerated() {
+            let f = ri == 0 ? headFont : font
+            for (c, cell) in row.enumerated() {
+                let plain = NSAttributedString(string: cell, attributes: [.font: f])
+                natural[c] = max(natural[c], plain.size().width)
             }
-            var base: [NSAttributedString.Key: Any] = [
-                .font: mono,
-                .foregroundColor: textColor,
-                .paragraphStyle: p
-            ]
-            if ri == 0 {
-                base[.font] = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+        }
+        let maxCol = contentWidth * 0.6
+        var colW = natural.map { min(max($0 + padX * 2, 32), maxCol) }
+        let avail = max(contentWidth, CGFloat(colCount) * 36)
+        var total = colW.reduce(0, +)
+        if total > avail {
+            let scale = avail / total
+            colW = colW.map { max($0 * scale, 20) }
+            total = colW.reduce(0, +)
+        }
+        if total < avail {
+            let scale = avail / total
+            colW = colW.map { $0 * scale }
+        }
+
+        // 2) 行高：按最终列宽对每个单元格做换行测量（对齐交给段落样式，多行也正确）
+        func cellAttr(_ text: String, _ f: NSFont, width: CGFloat, align: Int) -> NSAttributedString {
+            attributedInline(text, base: [.font: f, .foregroundColor: textColor,
+                                          .paragraphStyle: tableParaStyle(align: align)],
+                             contentWidth: width, onImageLoaded: nil)
+        }
+        func alignOf(_ c: Int) -> Int { c < table.aligns.count ? table.aligns[c] : 0 }
+        var rowHs: [CGFloat] = []
+        for (ri, row) in norm.enumerated() {
+            let f = ri == 0 ? headFont : font
+            var h: CGFloat = 16
+            for (c, cell) in row.enumerated() {
+                let w = max(colW[c] - padX * 2, 8)
+                let attr = cellAttr(cell, f, width: w, align: alignOf(c))
+                let rect = attr.boundingRect(
+                    with: NSSize(width: w, height: .greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin], context: nil)
+                h = max(h, rect.height)
             }
-            out.append(NSAttributedString(string: cells.joined(separator: "  ") + "\n", attributes: base))
+            rowHs.append(h + padY * 2)
         }
+
+        let tableW = colW.reduce(0, +)
+        let tableH = rowHs.reduce(0, +)
+        let size = NSSize(width: ceil(tableW), height: ceil(tableH))
+        let image = NSImage(size: size)
+        image.lockFocus()
+
+        // 3) 表头底色
+        NSColor.quaternaryLabelColor.setFill()
+        NSRect(x: 0, y: size.height - rowHs[0], width: size.width, height: rowHs[0]).fill()
+
+        // 4) 单元格文字（段落样式控制对齐，顶端对齐）
+        var yTop = size.height
+        for (ri, row) in norm.enumerated() {
+            let rowH = rowHs[ri]
+            yTop -= rowH
+            let f = ri == 0 ? headFont : font
+            var x: CGFloat = 0
+            for (c, cell) in row.enumerated() {
+                let w = colW[c]
+                let textW = max(w - padX * 2, 1)
+                let align = alignOf(c)
+                let attr = cellAttr(cell, f, width: textW, align: align)
+                let rect = attr.boundingRect(
+                    with: NSSize(width: textW, height: rowH),
+                    options: [.usesLineFragmentOrigin], context: nil)
+                attr.draw(with: NSRect(x: x + padX, y: yTop + rowH - padY - rect.height,
+                                       width: textW, height: rect.height),
+                          options: [.usesLineFragmentOrigin], context: nil)
+                x += w
+            }
+        }
+
+        // 5) 框线：外框 + 内部竖线 + 行间横线（表头下横线加粗）
+        NSColor.tertiaryLabelColor.setStroke()
+        let grid = NSBezierPath()
+        grid.lineWidth = 1
+        grid.appendRect(NSRect(x: 0.5, y: 0.5, width: size.width - 1, height: size.height - 1))
+        var vx: CGFloat = 0
+        for c in 0..<(colCount - 1) {
+            vx += colW[c]
+            let xx = (vx + 0.5).rounded()
+            grid.move(to: NSPoint(x: xx, y: 0))
+            grid.line(to: NSPoint(x: xx, y: size.height))
+        }
+        var hy: CGFloat = size.height
+        for ri in 0..<(norm.count - 1) {
+            hy -= rowHs[ri]
+            grid.move(to: NSPoint(x: 0, y: hy.rounded()))
+            grid.line(to: NSPoint(x: size.width, y: hy.rounded()))
+        }
+        grid.stroke()
+        let headLine = NSBezierPath()
+        headLine.lineWidth = 1.5
+        let hyHead = (size.height - rowHs[0]).rounded()
+        headLine.move(to: NSPoint(x: 0, y: hyHead))
+        headLine.line(to: NSPoint(x: size.width, y: hyHead))
+        headLine.stroke()
+
+        image.unlockFocus()
+        return image
     }
 
-    /// 等宽字体下的显示宽度（CJK 全角记 2）
-    static func displayWidth(_ s: String) -> Int {
-        var w = 0
-        for ch in s {
-            let v = Int(ch.unicodeScalars.first?.value ?? 0)
-            w += isWide(v) ? 2 : 1
+    private static func tableParaStyle(align: Int) -> NSParagraphStyle {
+        let p = NSMutableParagraphStyle()
+        switch align {
+        case 1: p.alignment = .left
+        case 2: p.alignment = .center
+        case 3: p.alignment = .right
+        default: p.alignment = .left
         }
-        return w
-    }
-
-    static func isWide(_ v: Int) -> Bool {
-        (0x1100...0x115F).contains(v) || (0x2E80...0xA4CF).contains(v)
-            || (0xAC00...0xD7A3).contains(v) || (0xF900...0xFAFF).contains(v)
-            || (0xFE30...0xFE4F).contains(v) || (0xFF00...0xFF60).contains(v)
-            || (0x20000...0x3FFFD).contains(v)
-    }
-
-    static func padCell(_ s: String, to width: Int) -> String {
-        let w = displayWidth(s)
-        if w <= width {
-            return s + String(repeating: " ", count: width - w)
-        }
-        var chars: [Character] = []
-        var cw = 0
-        for ch in s {
-            let v = Int(ch.unicodeScalars.first?.value ?? 0)
-            let cw2 = isWide(v) ? 2 : 1
-            if cw + cw2 > width - 1 { break }
-            chars.append(ch)
-            cw += cw2
-        }
-        return String(chars) + "…"
+        p.lineSpacing = 2
+        return p
     }
 
     /// 内联语法 -> 富文本：行内代码 > 图片 > 加粗 > 斜体 > 删除线 > 链接

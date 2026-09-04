@@ -143,6 +143,10 @@ enum MDParser {
                     || isUnorderedItem(lines[i]) || isOrderedItem(lines[i]) {
                     break
                 }
+                // 表格可紧跟段落（GFM 语义）：当前行含 | 且下一行是分隔行
+                if t.contains("|"), i + 1 < lines.count, isTableDelimiter(lines[i + 1]) {
+                    break
+                }
                 para.append(lines[i])
                 i += 1
             }
@@ -251,7 +255,29 @@ enum MDParser {
         var s = t.trimmingCharacters(in: .whitespaces)
         if s.hasPrefix("|") { s.removeFirst() }
         if s.hasSuffix("|") { s.removeLast() }
-        return s.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        // 按未转义的 | 切分；\| 作为字面竖线保留在单元格内
+        var cells: [String] = []
+        var cur = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            let ch = s[i]
+            let next = s.index(after: i)
+            if ch == "\\" && next < s.endIndex && s[next] == "|" {
+                cur.append("|")
+                i = s.index(after: next)
+                continue
+            }
+            if ch == "|" {
+                cells.append(cur)
+                cur = ""
+                i = next
+                continue
+            }
+            cur.append(ch)
+            i = next
+        }
+        cells.append(cur)
+        return cells.map { $0.trimmingCharacters(in: .whitespaces) }
     }
 
     static func parseAligns(_ line: String) -> [Int] {

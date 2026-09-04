@@ -60,9 +60,10 @@ enum MarkdownRenderer {
             default: return ""
             }
         }
-        var out = "<table border=\"0\" cellpadding=\"4\" cellspacing=\"0\">"
+        // border=1 让备忘录把它渲染成带框线的原生表格（border-collapse 合并单元格线）
+        var out = "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\" style=\"border-collapse: collapse\">"
         out += "<tr>" + table.header.enumerated()
-            .map { "<th\(alignAttr($0.offset))>\(inline($0.element))</th>" }.joined() + "</tr>"
+            .map { "<th scope=\"col\"\(alignAttr($0.offset))>\(inline($0.element))</th>" }.joined() + "</tr>"
         for row in table.rows {
             out += "<tr>"
             for (ci, cell) in row.enumerated() {
