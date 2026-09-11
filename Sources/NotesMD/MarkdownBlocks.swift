@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 // MARK: - 块级解析（HTML / 富文本两个序列化器共用）
@@ -29,6 +30,9 @@ enum MDBlock {
     case list(MDList)
     case table(MDTable)
     case hr
+    /// HTML 对齐标签块：<div align="center">…</div> / <p align="right">…</p> / <center>…</center>
+    /// 块内按完整 Markdown 解析（标题、列表、表格等均可居中对齐）
+    case aligned(align: NSTextAlignment, blocks: [MDBlock])
 }
 
 enum MDParser {
@@ -53,11 +57,19 @@ enum MDParser {
 
             // 围栏代码块（``` 或 ~~~，可带语言名）
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
-                let fence = String(trimmed.prefix(3))
-                let lang = trimmed.dropFirst(3).trimmingCharacters(in: .whitespaces)
+                let fenceChar = trimmed[trimmed.startIndex]
+                var fenceLen = 0
+                for ch in trimmed {
+                    if ch == fenceChar { fenceLen += 1 } else { break }
+                }
+                let lang = String(trimmed.dropFirst(fenceLen)).trimmingCharacters(in: .whitespaces)
                 var code: [String] = []
                 i += 1
-                while i < lines.count && !lines[i].trimmingCharacters(in: .whitespaces).hasPrefix(fence) {
+                while i < lines.count {
+                    let t = lines[i].trimmingCharacters(in: .whitespaces)
+                    // 结束围栏：仅由同一字符组成且长度不小于开始围栏（CommonMark 语义）。
+                    // 代码内部"以 ``` 开头"的行（如内嵌示例、带语言名的行）不会提前结束块
+                    if !t.isEmpty, t.allSatisfy({ $0 == fenceChar }), t.count >= fenceLen { break }
                     code.append(lines[i])
                     i += 1
                 }
@@ -70,6 +82,29 @@ enum MDParser {
             if let m = MarkdownRenderer.match(#"^(#{1,6})\s+(.+?)\s*#*\s*$"#, line) {
                 out.append(.heading(level: m[0].count, text: m[1]))
                 i += 1
+                continue
+            }
+
+            // HTML 对齐标签块（居中/左/右）
+            if let (align, first, closed) = parseAlignBlockStart(line) {
+                var inner: [String] = []
+                if !first.trimmingCharacters(in: .whitespaces).isEmpty { inner.append(first) }
+                var j = i + 1
+                if !closed {
+                    while j < lines.count {
+                        let t = lines[j].trimmingCharacters(in: .whitespaces)
+                        if let closeIdx = Self.alignClosingIndex(in: t) {
+                            let before = String(t[..<t.index(t.startIndex, offsetBy: closeIdx)])
+                            if !before.trimmingCharacters(in: .whitespaces).isEmpty { inner.append(before) }
+                            j += 1
+                            break
+                        }
+                        inner.append(lines[j])
+                        j += 1
+                    }
+                }
+                out.append(.aligned(align: align, blocks: parseLines(inner)))
+                i = max(j, i + 1)
                 continue
             }
 
@@ -140,7 +175,8 @@ enum MDParser {
                 }
                 if t.hasPrefix("#") || t.hasPrefix(">") || t.hasPrefix("```") || t.hasPrefix("~~~")
                     || MarkdownRenderer.isHorizontalRule(t)
-                    || isUnorderedItem(lines[i]) || isOrderedItem(lines[i]) {
+                    || isUnorderedItem(lines[i]) || isOrderedItem(lines[i])
+                    || parseAlignBlockStart(lines[i]) != nil {
                     break
                 }
                 // 表格可紧跟段落（GFM 语义）：当前行含 | 且下一行是分隔行
@@ -205,6 +241,45 @@ enum MDParser {
             i += 1
         }
         return (list, i)
+    }
+
+    // MARK: - HTML 对齐标签
+
+    /// 识别行首的 <div align="…"> / <p align="…"> / <center|left|right> 起始标签。
+    /// 返回 (对齐方式, 起始标签后的内容[已去掉同行闭合标签], 同一行内是否已闭合)。
+    static func parseAlignBlockStart(_ line: String) -> (NSTextAlignment, String, Bool)? {
+        var align: NSTextAlignment?
+        var rest: String?
+        if let m = MarkdownRenderer.match(#"^\s*<(div|p)\b[^>]*?\balign\s*=\s*["'"]?(center|right|left)["'"]?[^>]*>\s*(.*)$"#, line) {
+            align = alignStyle(m[1])
+            rest = m[2]
+        } else if let m = MarkdownRenderer.match(#"^\s*<(center|left|right)>\s*(.*)$"#, line) {
+            align = alignStyle(m[0])
+            rest = m[1]
+        }
+        guard let a = align, let r0 = rest else { return nil }
+        // 同行闭合：取第一个闭合标签之前的内容
+        if let closeIdx = alignClosingIndex(in: r0) {
+            return (a, String(r0[..<r0.index(r0.startIndex, offsetBy: closeIdx)]), true)
+        }
+        return (a, r0, false)
+    }
+
+    /// 行（去首尾空白后）以任一闭合标签结尾时，返回闭合标签在行内的起始下标
+    static func alignClosingIndex(in t: String) -> Int? {
+        let t = t.trimmingCharacters(in: .whitespaces)
+        for tag in ["</div>", "</p>", "</center>", "</left>", "</right>"] {
+            if t.hasSuffix(tag) { return t.count - tag.count }
+        }
+        return nil
+    }
+
+    static func alignStyle(_ s: String) -> NSTextAlignment {
+        switch s.lowercased() {
+        case "center": return .center
+        case "right": return .right
+        default: return .left
+        }
     }
 
     // MARK: - 辅助

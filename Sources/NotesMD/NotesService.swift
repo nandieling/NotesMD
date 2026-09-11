@@ -58,6 +58,33 @@ enum NotesService {
         }
     }
 
+    /// 读取指定笔记的正文 HTML（用于「选择备忘录」后把内容转成 Markdown 装入编辑区）
+    static func noteHTML(id: String) -> Result<String, Error> {
+        let script = """
+        on run argv
+            set theID to item 1 of argv
+            tell application "Notes"
+                repeat with n in (notes)
+                    if id of n is theID then
+                        return body of n
+                    end if
+                end repeat
+            end tell
+            return ""
+        end run
+        """
+        switch runAppleScript(script, args: [id]) {
+        case .success(let out):
+            if out.isEmpty {
+                return .failure(NSError(domain: "NotesMD", code: 5,
+                                        userInfo: [NSLocalizedDescriptionKey: "读不到该备忘录的正文"]))
+            }
+            return .success(out)
+        case .failure(let e):
+            return .failure(e)
+        }
+    }
+
     /// 列出全部笔记（id + 标题），用于选择要关联的笔记
     static func listNotes() -> Result<[(id: String, name: String)], Error> {
         // 按账号/文件夹遍历，跳过「最近删除」（其中的笔记不可修改）

@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 export SWIFTPM_MODULECACHE_OVERRIDE="$PWD/.build/module-cache"
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/module-cache"
-swift build -c release
+swift build -c release --disable-sandbox
 
 APP="build/NotesMD.app"
 rm -rf "$APP"

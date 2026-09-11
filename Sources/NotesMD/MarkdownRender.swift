@@ -70,14 +70,25 @@ extension MarkdownRenderer {
                 }
 
             case .code(_, let code):
-                let p = paraStyle(head: indent, before: 8, after: 8, line: 2)
-                let base: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                    .foregroundColor: textColor,
-                    .backgroundColor: NSColor(white: 0.93, alpha: 1),
-                    .paragraphStyle: p
-                ]
-                out.append(NSAttributedString(string: code.joined(separator: "\n") + "\n", attributes: base))
+                let codeBg = NSColor(white: 0.93, alpha: 1)
+                // 逐行成段：代码中间的空行会成为同属性的空段落，行间无段距，
+                // 整块背景连续不断开；块间距只加在首行前 / 末行后。
+                // .backgroundColor 保留给不走文本视图的路径（--png）；
+                // CodeBlockAttributes 供 CodeBlockLayoutManager 做整块填充
+                for (idx, line) in code.enumerated() {
+                    let p = paraStyle(head: indent,
+                                      before: idx == 0 ? 8 : 0,
+                                      after: idx == code.count - 1 ? 8 : 0,
+                                      line: 2)
+                    let base: [NSAttributedString.Key: Any] = [
+                        .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                        .foregroundColor: textColor,
+                        .backgroundColor: codeBg,
+                        CodeBlockAttributes.background: codeBg,
+                        .paragraphStyle: p
+                    ]
+                    out.append(NSAttributedString(string: line + "\n", attributes: base))
+                }
 
             case .quote(let inner):
                 appendBlocks(inner, to: out, indent: indent + 18, quoteDepth: quoteDepth + 1,
@@ -99,6 +110,62 @@ extension MarkdownRenderer {
                     .paragraphStyle: p
                 ]
                 out.append(NSAttributedString(string: String(repeating: "─", count: 36) + "\n", attributes: base))
+
+            case .aligned(let align, let inner):
+                renderAlignedBlocks(inner, align: align, into: out, indent: indent,
+                                    quoteDepth: quoteDepth,
+                                    contentWidth: contentWidth, onImageLoaded: onImageLoaded)
+            }
+        }
+    }
+
+    /// 对齐标签块内：标题/段落按指定对齐渲染（保留加粗与字号），其余块类型走通用渲染
+    private static func renderAlignedBlocks(_ blocks: [MDBlock], align: NSTextAlignment,
+                                            into out: NSMutableAttributedString,
+                                            indent: CGFloat, quoteDepth: Int,
+                                            contentWidth: CGFloat, onImageLoaded: (() -> Void)?) {
+        let textColor: NSColor = quoteDepth > 0 ? .secondaryLabelColor : .labelColor
+        let paraSize: CGFloat = quoteDepth > 0 ? 13 : 14
+
+        func alignStyle(head: CGFloat, before: CGFloat = 0, after: CGFloat = 0, line: CGFloat = 0) -> NSParagraphStyle {
+            let p = NSMutableParagraphStyle()
+            p.headIndent = head
+            p.paragraphSpacingBefore = before
+            p.paragraphSpacing = after
+            p.lineSpacing = line
+            p.alignment = align
+            return p
+        }
+
+        for block in blocks {
+            switch block {
+            case .heading(let level, let text):
+                let size = headingSizes[min(max(level, 1), 6) - 1]
+                let base: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.boldSystemFont(ofSize: size),
+                    .foregroundColor: textColor,
+                    .paragraphStyle: alignStyle(head: indent, before: 12, after: 4)
+                ]
+                out.append(attributedInline(text, base: base,
+                                            contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+                out.append(NSAttributedString(string: "\n", attributes: base))
+
+            case .paragraph(let lines):
+                let base: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: paraSize),
+                    .foregroundColor: textColor,
+                    .paragraphStyle: alignStyle(head: indent, after: 8, line: 4)
+                ]
+                let text = lines.isEmpty ? [""] : lines
+                for line in text {
+                    out.append(attributedInline(line, base: base,
+                                                contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+                    out.append(NSAttributedString(string: "\n", attributes: base))
+                }
+
+            default:
+                appendBlocks([block], to: out, indent: indent, quoteDepth: quoteDepth,
+                              contentWidth: contentWidth, onImageLoaded: onImageLoaded)
             }
         }
     }
@@ -358,10 +425,10 @@ extension MarkdownRenderer {
                 // 反斜杠转义：输出被转义字符本身（纯文本）
                 result.append(NSAttributedString(string: b.groups[1], attributes: base))
             case 1:
+                // 行内代码只换等宽字体，不加背景填充；背景底色只属于三引号（围栏）代码块
                 if let f = attrs[.font] as? NSFont {
                     attrs[.font] = NSFont.monospacedSystemFont(ofSize: max(f.pointSize - 1.5, 10), weight: .regular)
                 }
-                attrs[.backgroundColor] = NSColor(white: 0.93, alpha: 1)
                 result.append(NSAttributedString(string: b.groups[0], attributes: attrs))
             case 2:
                 // 图床图片：以文本附件插入；未命中缓存时先放占位图，下载完成后整体重渲染

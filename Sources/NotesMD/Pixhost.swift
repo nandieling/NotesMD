@@ -358,12 +358,8 @@ final class PixResultSheet: NSObject {
 // MARK: - 历史图片窗口（列表 / 卡片、分页、复制、移除）
 
 final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
-    enum Mode { case list, card }
-
     private var items: [PixImage] = []
-    private var mode: Mode = .list
     private var page = 1
-    private var seg: NSSegmentedControl!
     private var prevBtn: NSButton!
     private var nextBtn: NSButton!
     private var pageLabel: NSTextField!
@@ -381,7 +377,7 @@ final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
         return f
     }()
 
-    private var pageSize: Int { mode == .list ? 20 : 12 }
+    private var pageSize: Int { 12 }
     private var pageCount: Int { max(1, (items.count + pageSize - 1) / pageSize) }
     private var pageItems: [PixImage] {
         let s = (page - 1) * pageSize
@@ -400,17 +396,12 @@ final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
         build()
     }
 
-    /// 测试用：切换显示模式
-    func setModeForTesting(_ m: Mode) {
-        mode = m
-        seg.selectedSegment = (m == .card) ? 1 : 0
-        page = 1
-        rebuild()
-    }
-
     /// 打开并刷新数据
     func showWindowAndReload() {
         reload()
+        if let content = window?.contentView {
+            _ = BackgroundOverlay.shared.attach(to: content)
+        }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -425,6 +416,8 @@ final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
 
     private func build() {
         guard let content = window?.contentView else { return }
+        // 弹窗自身也铺背景图（跟随主窗口设置）
+        _ = BackgroundOverlay.shared.attach(to: content)
         let W = content.bounds.width
         let H = content.bounds.height
 
@@ -438,13 +431,6 @@ final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
         countLabel.textColor = .secondaryLabelColor
         countLabel.autoresizingMask = [.maxXMargin, .minYMargin]
         top.addSubview(countLabel)
-
-        seg = NSSegmentedControl(labels: ["列表", "卡片"],
-                                 trackingMode: .selectOne,
-                                 target: self, action: #selector(modeChanged(_:)))
-        seg.selectedSegment = 0
-        seg.autoresizingMask = [.minXMargin, .minYMargin]
-        top.addSubview(seg)
 
         prevBtn = iconButton("chevron.left", action: #selector(prevPage), tooltip: "上一页")
         nextBtn = iconButton("chevron.right", action: #selector(nextPage), tooltip: "下一页")
@@ -485,7 +471,6 @@ final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
         nextBtn.frame = NSRect(x: W - 42, y: cy - 2, width: 30, height: 30)
         prevBtn.frame = NSRect(x: W - 158, y: cy - 2, width: 30, height: 30)
         pageLabel.frame = NSRect(x: W - 124, y: cy + 2, width: 62, height: 20)
-        seg.frame = NSRect(x: W - 292, y: cy, width: 120, height: 24)
     }
 
     func windowDidResize(_ notification: Notification) {
@@ -509,12 +494,6 @@ final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
         return b
     }
 
-    @objc private func modeChanged(_ sender: NSSegmentedControl) {
-        mode = sender.selectedSegment == 1 ? .card : .list
-        page = 1
-        rebuild()
-    }
-
     @objc private func prevPage() {
         page = max(1, page - 1)
         rebuild()
@@ -536,7 +515,7 @@ final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
         actions = []
         let w = max(scroll.contentSize.width, 320)
         let h = max(scroll.contentSize.height, 200)
-        scroll.documentView = (mode == .list) ? makeListDoc(width: w, viewportH: h) : makeCardDoc(width: w, viewportH: h)
+        scroll.documentView = makeCardDoc(width: w, viewportH: h)
     }
 
     private func emptyDoc(width: CGFloat, height: CGFloat) -> NSView {
@@ -548,62 +527,6 @@ final class PixHistoryWindowController: NSWindowController, NSWindowDelegate {
         label.frame = NSRect(x: 0, y: 30, width: width, height: 24)
         doc.addSubview(label)
         return doc
-    }
-
-    private func makeListDoc(width: CGFloat, viewportH: CGFloat) -> NSView {
-        let rows = pageItems
-        let rowH: CGFloat = 72
-        guard !rows.isEmpty else { return emptyDoc(width: width, height: viewportH) }
-        let h = max(CGFloat(rows.count) * rowH + 8, viewportH)
-        let doc = FlippedView(frame: NSRect(x: 0, y: 0, width: width, height: h))
-        for (i, item) in rows.enumerated() {
-            doc.addSubview(makeRow(item, y: CGFloat(i) * rowH + 4, width: width))
-        }
-        return doc
-    }
-
-    private func makeRow(_ item: PixImage, y: CGFloat, width: CGFloat) -> NSView {
-        let rowH: CGFloat = 72
-        let row = NSView(frame: NSRect(x: 0, y: y, width: width, height: rowH))
-
-        let thumb = ThumbnailView(frame: NSRect(x: 10, y: 8, width: 56, height: 56))
-        thumb.load(urlString: item.thumb.isEmpty ? item.direct : item.thumb)
-        row.addSubview(thumb)
-
-        let name = NSTextField(labelWithString: item.name)
-        name.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        name.lineBreakMode = .byTruncatingTail
-        name.frame = NSRect(x: 80, y: rowH - 26, width: width - 240, height: 18)
-        name.toolTip = item.direct
-        row.addSubview(name)
-
-        let meta = NSTextField(labelWithString: Self.dateFmt.string(from: item.date)
-            + (item.size.map { " · \(ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file))" } ?? ""))
-        meta.font = NSFont.systemFont(ofSize: 11)
-        meta.textColor = .secondaryLabelColor
-        meta.frame = NSRect(x: 80, y: rowH - 44, width: width - 240, height: 14)
-        row.addSubview(meta)
-
-        let link = NSTextField(labelWithString: item.direct)
-        link.font = NSFont.systemFont(ofSize: 10.5)
-        link.textColor = .tertiaryLabelColor
-        link.lineBreakMode = .byTruncatingMiddle
-        link.frame = NSRect(x: 80, y: rowH - 60, width: width - 240, height: 13)
-        row.addSubview(link)
-
-        let act = ItemActions(item: item,
-                              onCopy: { [weak self] in self?.copyLink(item) },
-                              onRemove: { [weak self] in self?.confirmRemove(item) })
-        actions.append(act)
-        let copyB = iconButton("doc.on.doc", action: #selector(ItemActions.copyLink), tooltip: "复制原图链接")
-        copyB.target = act
-        copyB.frame = NSRect(x: width - 84, y: 21, width: 34, height: 30)
-        row.addSubview(copyB)
-        let delB = iconButton("trash", action: #selector(ItemActions.remove), tooltip: "移除")
-        delB.target = act
-        delB.frame = NSRect(x: width - 46, y: 21, width: 34, height: 30)
-        row.addSubview(delB)
-        return row
     }
 
     private func makeCardDoc(width: CGFloat, viewportH: CGFloat) -> NSView {

@@ -30,6 +30,34 @@ enum MarkdownRenderer {
             return htmlTable(table)
         case .hr:
             return "<hr>"
+        case .aligned(let align, let inner):
+            let name: String
+            switch align {
+            case .center: name = "center"
+            case .right: name = "right"
+            default: name = "left"
+            }
+            // align 属性给备忘录，style 给标准渲染器，双保险；
+            // 块内标题/列表/表格按对应标签输出，段落行用 <br> 连接
+            var body: [String] = []
+            var paraLines: [String] = []
+            func flushPara() {
+                if !paraLines.isEmpty {
+                    body.append("<p>" + paraLines.map(inline).joined(separator: "<br>") + "</p>")
+                    paraLines = []
+                }
+            }
+            for b in inner {
+                if case .paragraph(let ls) = b {
+                    paraLines.append(contentsOf: ls)
+                } else {
+                    flushPara()
+                    body.append(htmlBlock(b))
+                }
+            }
+            flushPara()
+            return "<div align=\"\(name)\" style=\"text-align: \(name)\">"
+                + body.joined(separator: "<br>") + "</div>"
         }
     }
 
@@ -156,7 +184,10 @@ enum MarkdownRenderer {
             .replacingOccurrences(of: "\r\n", with: "\n")
             .components(separatedBy: "\n")
         guard let idx = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
-        else { return markdown }
+        else {
+            // 正文为空但有标题时，输出仅含标题的 markdown（预览/推送一致）
+            return explicitTitle.isEmpty ? markdown : "# " + explicitTitle
+        }
         var result = lines
         if let m = match(#"^(#{1,6})\s+(.+?)\s*#*\s*$"#, lines[idx]) {
             result[idx] = "# " + (explicitTitle.isEmpty ? m[1] : explicitTitle)
