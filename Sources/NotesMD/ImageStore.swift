@@ -5,6 +5,19 @@ import Foundation
 final class ImageStore {
     static let shared = ImageStore()
 
+    private static var baseStorage: URL = FileManager.default.homeDirectoryForCurrentUser
+
+    /// 相对图片路径的基准目录（应为绝对路径）。
+    /// 默认用户主目录；编辑器打开 .md 文件后由 App 改为该文件所在目录。
+    static var baseDirectory: URL {
+        get {
+            baseStorage.isFileURL && baseStorage.path.hasPrefix("/")
+                ? baseStorage
+                : FileManager.default.homeDirectoryForCurrentUser
+        }
+        set { baseStorage = newValue }
+    }
+
     private let cache = NSCache<NSURL, NSImage>()
     private var inflight: [String: [(NSImage?) -> Void]] = [:]
     private let queue = DispatchQueue(label: "notesmd.imagestore")
@@ -13,17 +26,22 @@ final class ImageStore {
         cache.countLimit = 64
     }
 
-    /// 解析图片地址：http/https/file URL，或本地绝对路径
+    /// 解析图片地址：http/https/file URL、本地绝对路径、~ 开头路径，
+    /// 或相对路径（按 baseDirectory 解析）
     static func url(from text: String) -> URL? {
         let t = text.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return nil }
         if let url = URL(string: t), let scheme = url.scheme,
            ["http", "https", "file"].contains(scheme.lowercased()) {
             return url
         }
-        if t.hasPrefix("/") {
-            return URL(fileURLWithPath: t)
+        let path = (t as NSString).expandingTildeInPath
+        if path.hasPrefix("/") {
+            return URL(fileURLWithPath: path)
         }
-        return nil
+        return baseDirectory.standardizedFileURL
+            .appendingPathComponent(path)
+            .standardizedFileURL
     }
 
     /// 同步取缓存；未命中返回 nil

@@ -667,6 +667,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         guard confirmDiscardIfDirty() else { return }
         mode = .md
         fileURL = nil
+        ImageStore.baseDirectory = FileManager.default.homeDirectoryForCurrentUser
         isDirty = false
         hasPushedToNotes = false
         isProgrammaticChange = true
@@ -693,6 +694,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         }
         mode = .md
         fileURL = url
+        ImageStore.baseDirectory = url.deletingLastPathComponent()
         isDirty = false
         hasPushedToNotes = false
         isProgrammaticChange = true
@@ -718,6 +720,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         panel.nameFieldStringValue = fileURL?.lastPathComponent ?? "未命名.md"
         guard panel.runModal() == .OK, let url = panel.url else { return false }
         fileURL = url
+        ImageStore.baseDirectory = url.deletingLastPathComponent()
         return save(to: url)
     }
 
@@ -1642,6 +1645,15 @@ func runCLI() -> Bool {
     }
     if let idx = args.firstIndex(of: "--screenshot"), idx + 1 < args.count {
         let md = (try? String(contentsOfFile: args[idx + 1], encoding: .utf8)) ?? ""
+        // 相对图片路径按该 md 文件所在目录解析（与打开文件后的行为一致；NMD_BASE_DIR 可覆盖）
+        if let envBase = ProcessInfo.processInfo.environment["NMD_BASE_DIR"] {
+            ImageStore.baseDirectory = URL(fileURLWithPath: (envBase as NSString).expandingTildeInPath)
+        } else {
+            let srcURL = URL(fileURLWithPath: (args[idx + 1] as NSString).expandingTildeInPath)
+            if srcURL.isFileURL, srcURL.path.hasPrefix("/") {
+                ImageStore.baseDirectory = srcURL.deletingLastPathComponent()
+            }
+        }
         let outPath = (idx + 2 < args.count) ? args[idx + 2] : "/tmp/nmd-test/shot.png"
         var bgURL: URL?
         var bgAlpha: CGFloat = 1
@@ -1691,6 +1703,11 @@ func runCLI() -> Bool {
         Timer.scheduledTimer(withTimeInterval: waitSec, repeats: false) { _ in
             guard let content = wc.window?.contentView else {
                 NSApp.terminate(nil); return
+            }
+            // 测试：滚动预览到指定 y（验证折叠线下方代码块底色等）
+            if let scrollY = ProcessInfo.processInfo.environment["NMD_SHOT_SCROLL"].flatMap(Double.init) {
+                wc.previewTextView.scroll(NSPoint(x: 0, y: scrollY))
+                wc.previewTextView.window?.display()
             }
             content.displayIfNeeded()
             if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
@@ -2111,6 +2128,11 @@ func runCLI() -> Bool {
         if args[idx + 1] == "-d" {
             attr = MarkdownRenderer.render(Sample.markdown)
         } else if let r = try? String(contentsOfFile: args[idx + 1], encoding: .utf8) {
+            let inPath = (args[idx + 1] as NSString).expandingTildeInPath
+            let inURL = URL(fileURLWithPath: inPath)
+            ImageStore.baseDirectory = (inURL.isFileURL && inURL.path.hasPrefix("/"))
+                ? inURL.deletingLastPathComponent()
+                : URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             attr = MarkdownRenderer.render(r)
         } else {
             FileHandle.standardError.write(Data("读取文件失败\n".utf8)); return true

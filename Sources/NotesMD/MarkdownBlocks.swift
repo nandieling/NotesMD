@@ -46,13 +46,34 @@ enum MDParser {
         var i = 0
 
         while i < lines.count {
-            let line = lines[i]
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            var line = lines[i]
+            var trimmed = line.trimmingCharacters(in: .whitespaces)
 
             // 空行
             if trimmed.isEmpty {
                 i += 1
                 continue
+            }
+
+            // HTML 注释 <!-- ... -->：跳过（可跨行；同行注释后可继续解析剩余内容）
+            if trimmed.hasPrefix("<!--") {
+                if let cr = trimmed.range(of: "-->") {
+                    let restOfLine = String(trimmed[cr.upperBound...]).trimmingCharacters(in: .whitespaces)
+                    if restOfLine.isEmpty {
+                        i += 1
+                        continue
+                    }
+                    line = restOfLine
+                    trimmed = restOfLine
+                } else {
+                    var j = i
+                    while j < lines.count {
+                        if lines[j].contains("-->") { j += 1; break }
+                        j += 1
+                    }
+                    i = j
+                    continue
+                }
             }
 
             // 围栏代码块（``` 或 ~~~，可带语言名）
@@ -105,6 +126,21 @@ enum MDParser {
                 }
                 out.append(.aligned(align: align, blocks: parseLines(inner)))
                 i = max(j, i + 1)
+                continue
+            }
+
+            // HTML 块标签（h1-h6 / hr / pre / blockquote / ul / ol / table / div / p 等）
+            if trimmed.hasPrefix("<"),
+               let tag = HtmlScanner.firstTag(in: trimmed), tag.range.location == 0,
+               htmlBlockTagNames.contains(tag.name) {
+                if tag.closing {
+                    // 孤立的闭合标签行：忽略
+                    i += 1
+                    continue
+                }
+                let after = (trimmed as NSString).substring(from: tag.range.length)
+                i = parseHTMLBlock(tag: tag, name: tag.name, after: after,
+                                   lines: lines, i: i, out: &out)
                 continue
             }
 
@@ -176,7 +212,8 @@ enum MDParser {
                 if t.hasPrefix("#") || t.hasPrefix(">") || t.hasPrefix("```") || t.hasPrefix("~~~")
                     || MarkdownRenderer.isHorizontalRule(t)
                     || isUnorderedItem(lines[i]) || isOrderedItem(lines[i])
-                    || parseAlignBlockStart(lines[i]) != nil {
+                    || parseAlignBlockStart(lines[i]) != nil
+                    || isHTMLBlockStart(lines[i]) {
                     break
                 }
                 // 表格可紧跟段落（GFM 语义）：当前行含 | 且下一行是分隔行
@@ -280,6 +317,360 @@ enum MDParser {
         case "right": return .right
         default: return .left
         }
+    }
+
+    // MARK: - HTML 块标签
+
+    static let htmlBlockTagNames: Set<String> = [
+        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "pre", "blockquote",
+        "ul", "ol", "table", "div", "section", "article", "main", "header", "footer", "p"
+    ]
+
+    /// 行是否以可识别的块级 HTML 标签开头（供段落提前结束判断）
+    static func isHTMLBlockStart(_ line: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        guard t.hasPrefix("<"), let tag = HtmlScanner.firstTag(in: t), tag.range.location == 0
+        else { return false }
+        return htmlBlockTagNames.contains(tag.name)
+    }
+
+    /// 解析 lines[i] 起始的 HTML 块，返回块结束后的行下标
+    private static func parseHTMLBlock(tag: HtmlTag, name: String, after: String,
+                                       lines: [String], i: Int,
+                                       out: inout [MDBlock]) -> Int {
+        // 同行已闭合：取闭合标签之前的内容
+        func sameLineClose() -> (firstPart: String, next: Int)? {
+            guard let idx = closingTagIndex(name, in: after) else { return nil }
+            return ((after as NSString).substring(to: idx), i + 1)
+        }
+        func collect() -> (inner: [String], next: Int) {
+            var inner: [String] = []
+            if let close = sameLineClose() {
+                if !close.firstPart.trimmingCharacters(in: .whitespaces).isEmpty { inner.append(close.firstPart) }
+                return (inner, close.next)
+            }
+            let next = collectUntil(name, after: after, lines: lines, i: i, inner: &inner)
+            return (inner, next)
+        }
+        switch name {
+        case "hr":
+            out.append(.hr)
+            return i + 1
+        case "h1", "h2", "h3", "h4", "h5", "h6":
+            let (inner, next) = collect()
+            let text = inner.joined(separator: " ").trimmingCharacters(in: .whitespaces)
+            if !text.isEmpty {
+                out.append(.heading(level: Int(name.suffix(1)) ?? 1, text: text))
+            }
+            return next
+        case "pre":
+            let (code0, next) = collect()
+            var code = code0
+            var lang: String?
+            if let idx = code.firstIndex(where: { $0.range(of: "<code", options: .caseInsensitive) != nil }),
+               let r = code[idx].range(of: "<code", options: .caseInsensitive),
+               let gt = code[idx][r.upperBound...].firstIndex(of: ">") {
+                let attrs = String(code[idx][r.upperBound..<gt])
+                if let m = MarkdownRenderer.match(#"language-([a-zA-Z0-9#+-]+)"#, attrs) {
+                    lang = m[0]
+                }
+                code[idx] = String(code[idx][code[idx].index(after: gt)...])
+            }
+            if let lastIdx = code.indices.last,
+               let r = code[lastIdx].range(of: "</code>", options: .caseInsensitive) {
+                code[lastIdx] = String(code[lastIdx][..<r.lowerBound])
+            }
+            if !code.allSatisfy({ $0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+                out.append(.code(lang: lang, lines: code.map(HtmlStyle.unescapeEntities)))
+            }
+            return next
+        case "blockquote":
+            let (inner, next) = collect()
+            if !inner.allSatisfy({ $0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+                out.append(.quote(parseLines(inner)))
+            }
+            return next
+        case "ul", "ol":
+            let (innerLines, next) = collectBalanced(name, after: after, lines: lines, i: i)
+            let start = Int(tag.attr("start") ?? "") ?? 1
+            let md = htmlListToMarkdownLines(innerLines.joined(separator: "\n"),
+                                             ordered: name == "ol", start: start, indent: 0)
+            let (list, _) = parseListLevel(md, i: 0, ordered: name == "ol", start: start, baseIndent: 0)
+            if !list.items.isEmpty { out.append(.list(list)) }
+            return next
+        case "table":
+            let (innerLines, next) = collect()
+            if let table = htmlTable(from: innerLines.joined(separator: "\n")) {
+                out.append(.table(table))
+            }
+            return next
+        case "p":
+            let (inner, next) = collect()
+            let body = inner.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            if !body.isEmpty { out.append(.paragraph(body)) }
+            return next
+        default:
+            // div / section / article / main / header / footer：透明容器
+            let (inner, next) = collect()
+            out.append(contentsOf: parseLines(inner))
+            return next
+        }
+    }
+
+    /// 收集块内容（起始标签后的同行部分 + 后续行），直到含闭合标签的行（不含）
+    private static func collectUntil(_ name: String, after: String,
+                                     lines: [String], i: Int,
+                                     inner: inout [String]) -> Int {
+        if !after.trimmingCharacters(in: .whitespaces).isEmpty { inner.append(after) }
+        if closingTagIndex(name, in: after) != nil { return i + 1 }
+        var j = i + 1
+        while j < lines.count {
+            if let idx = closingTagIndex(name, in: lines[j]) {
+                let before = (lines[j] as NSString).substring(to: idx)
+                if !before.trimmingCharacters(in: .whitespaces).isEmpty { inner.append(before) }
+                return j + 1
+            }
+            inner.append(lines[j])
+            j += 1
+        }
+        return j
+    }
+
+    private static func closingTagIndex(_ name: String, in line: String) -> Int? {
+        guard let re = try? NSRegularExpression(pattern: "</" + name + "\\s*>",
+                                                options: [.caseInsensitive]) else { return nil }
+        let ns = line as NSString
+        guard let m = re.firstMatch(in: line,
+                                    range: NSRange(location: 0, length: ns.length)) else { return nil }
+        return m.range.location
+    }
+
+    /// 收集块内容，按同名标签嵌套计数（用于可嵌套的列表）。
+    /// 除最终闭合标签外，行内的开/闭标签都原样保留在内容里。
+    private static func collectBalanced(_ name: String, after: String,
+                                        lines: [String], i: Int) -> (inner: [String], next: Int) {
+        guard let openRe = try? NSRegularExpression(pattern: "<" + name + "\\b",
+                                                    options: [.caseInsensitive]),
+              let closeRe = try? NSRegularExpression(pattern: "</" + name + "\\s*>",
+                                                     options: [.caseInsensitive]) else { return ([], i + 1) }
+        var inner: [String] = []
+        var depth = 1
+        var text = after
+        var j = i
+        while true {
+            var remaining = text
+            while let ev = nextTagEvent(openRe, closeRe, in: remaining) {
+                if ev.isClose {
+                    depth -= 1
+                    if depth == 0 {
+                        let before = (remaining as NSString).substring(to: ev.start)
+                        if !before.trimmingCharacters(in: .whitespaces).isEmpty { inner.append(before) }
+                        return (inner, j + 1)
+                    }
+                } else {
+                    depth += 1
+                }
+                // 嵌套的开/闭标签保留在内容中（整行稍后原样加入），扫描跳过该事件
+                remaining = (remaining as NSString).substring(from: ev.end)
+            }
+            if !text.trimmingCharacters(in: .whitespaces).isEmpty { inner.append(text) }
+            j += 1
+            guard j < lines.count else { break }
+            text = lines[j]
+        }
+        return (inner, j)
+    }
+
+    private static func nextTagEvent(_ openRe: NSRegularExpression, _ closeRe: NSRegularExpression,
+                                     in s: String) -> (isClose: Bool, start: Int, end: Int)? {
+        let ns = s as NSString
+        var best: (isClose: Bool, start: Int, end: Int)?
+        func consider(_ re: NSRegularExpression, isClose: Bool) {
+            guard let m = re.firstMatch(in: s, range: NSRange(location: 0, length: ns.length))
+            else { return }
+            if let b = best {
+                if m.range.location < b.start {
+                    best = (isClose, m.range.location, m.range.upperBound)
+                }
+            } else {
+                best = (isClose, m.range.location, m.range.upperBound)
+            }
+        }
+        consider(openRe, isClose: false)
+        consider(closeRe, isClose: true)
+        return best
+    }
+
+    /// 抽取 text 中指定标签的所有顶层块（按出现顺序）；同名嵌套整体消费
+    static func topChunks(_ tags: [String], in text: String)
+        -> [(name: String, attrs: [String: String], inner: String)] {
+        let tagAlt = tags.joined(separator: "|")
+        guard let openRe = try? NSRegularExpression(pattern: "<(" + tagAlt + ")\\b[^>]*>",
+                                                   options: [.caseInsensitive]),
+              let closeRe = try? NSRegularExpression(pattern: "</(" + tagAlt + ")\\s*>",
+                                                     options: [.caseInsensitive]) else { return [] }
+        let ns = text as NSString
+        var events: [(start: Int, end: Int, isClose: Bool, name: String, attrs: [String: String])] = []
+        for m in openRe.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            let tagText = ns.substring(with: m.range)
+            if let t = HtmlScanner.firstTag(in: tagText) {
+                events.append((m.range.location, m.range.upperBound, false, t.name, t.attrs))
+            }
+        }
+        for m in closeRe.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            let name = ns.substring(with: m.range(at: 1)).lowercased()
+            events.append((m.range.location, m.range.upperBound, true, name, [:]))
+        }
+        events.sort { $0.start < $1.start }
+        var out: [(name: String, attrs: [String: String], inner: String)] = []
+        var depth = 0
+        var curStart = 0
+        var curName = ""
+        var curAttrs: [String: String] = [:]
+        for e in events {
+            if !e.isClose {
+                if depth == 0 {
+                    curStart = e.end
+                    curName = e.name
+                    curAttrs = e.attrs
+                }
+                depth += 1
+            } else {
+                depth -= 1
+                if depth == 0, curStart <= e.start {
+                    let inner = ns.substring(with: NSRange(location: curStart, length: e.start - curStart))
+                    out.append((curName, curAttrs, inner))
+                }
+            }
+        }
+        return out
+    }
+
+    /// HTML 列表内容 -> Markdown 列表行（复用既有 Markdown 列表解析，支持嵌套）
+    private static func htmlListToMarkdownLines(_ text: String, ordered: Bool,
+                                                start: Int, indent: Int) -> [String] {
+        var out: [String] = []
+        let pad = String(repeating: "    ", count: indent)
+        var n = start
+        for item in topChunks(["li"], in: text) {
+            let (topLines, nested) = splitNestedLists(item.inner)
+            let body = topLines
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            if !body.isEmpty {
+                out.append(pad + (ordered ? "\(n). " : "- ") + body[0])
+                for extra in body.dropFirst() { out.append(pad + "    " + extra) }
+            }
+            n += 1
+            for (childOrdered, childText) in nested {
+                out += htmlListToMarkdownLines(childText, ordered: childOrdered,
+                                               start: 1, indent: indent + 1)
+            }
+        }
+        return out
+    }
+
+    /// 拆分条目内容：顶层文本（按行）+ 嵌套 ul/ol（按出现顺序）
+    private static func splitNestedLists(_ text: String)
+        -> (top: [String], nested: [(ordered: Bool, inner: String)]) {
+        guard let openRe = try? NSRegularExpression(pattern: "<(ul|ol)\\b[^>]*>",
+                                                   options: [.caseInsensitive]),
+              let closeRe = try? NSRegularExpression(pattern: "</(ul|ol)\\s*>",
+                                                     options: [.caseInsensitive])
+        else { return (text.components(separatedBy: "\n"), []) }
+        let ns = text as NSString
+        var events: [(start: Int, end: Int, isClose: Bool, name: String)] = []
+        for m in openRe.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            let name = ns.substring(with: m.range(at: 1)).lowercased()
+            events.append((m.range.location, m.range.upperBound, false, name))
+        }
+        for m in closeRe.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            let name = ns.substring(with: m.range(at: 1)).lowercased()
+            events.append((m.range.location, m.range.upperBound, true, name))
+        }
+        events.sort { $0.start < $1.start }
+        var topParts: [String] = []
+        var nested: [(ordered: Bool, inner: String)] = []
+        var depth = 0
+        var last = 0
+        var openName = ""
+        for e in events {
+            if !e.isClose {
+                if depth == 0 {
+                    if e.start > last {
+                        topParts.append(ns.substring(
+                            with: NSRange(location: last, length: e.start - last)))
+                    }
+                    openName = e.name
+                    last = e.end
+                }
+                depth += 1
+            } else {
+                depth -= 1
+                if depth == 0 {
+                    nested.append((openName == "ol",
+                                   ns.substring(
+                                       with: NSRange(location: last, length: e.start - last))))
+                    last = e.end
+                }
+            }
+        }
+        if last < ns.length { topParts.append(ns.substring(from: last)) }
+        return (topParts.flatMap { $0.components(separatedBy: "\n") }, nested)
+    }
+
+    /// 解析 <table>（tr/td/th，单元格可带 align）为 MDTable
+    private static func htmlTable(from text: String) -> MDTable? {
+        var cleaned = text
+        for tag in ["thead", "tbody", "tfoot"] {
+            cleaned = cleaned.replacingOccurrences(of: "<" + tag + "[^>]*>",
+                                                   with: "", options: .caseInsensitive)
+            cleaned = cleaned.replacingOccurrences(of: "</" + tag + ">",
+                                                   with: "", options: .caseInsensitive)
+        }
+        let rows = topChunks(["tr"], in: cleaned)
+        guard !rows.isEmpty else { return nil }
+        var header: [String] = []
+        var aligns: [Int] = []
+        var dataRows: [[String]] = []
+        var colCount = 0
+        for (idx, row) in rows.enumerated() {
+            let cells = topChunks(["td", "th"], in: row.inner)
+            let rowCells = cells.map { HtmlStyle.unescapeEntities(htmlStripTags($0.inner)) }
+            colCount = max(colCount, rowCells.count)
+            if idx == 0 && header.isEmpty {
+                header = rowCells
+                aligns = cells.map { cellAlign($0.attrs) }
+            } else {
+                dataRows.append(rowCells)
+            }
+        }
+        guard !header.isEmpty else { return nil }
+        let pad = { (row: [String]) -> [String] in
+            if row.count < header.count {
+                return row + Array(repeating: "", count: header.count - row.count)
+            }
+            return Array(row.prefix(header.count))
+        }
+        return MDTable(header: header, aligns: aligns, rows: dataRows.map(pad))
+    }
+
+    private static func cellAlign(_ attrs: [String: String]) -> Int {
+        switch (attrs["align"] ?? "").lowercased() {
+        case "center": return 2
+        case "right": return 3
+        default: return 0
+        }
+    }
+
+    /// 去掉所有 HTML 标签（<br> 换成空格），用于表格单元格纯文本
+    static func htmlStripTags(_ s: String) -> String {
+        var t = s
+        t = t.replacingOccurrences(of: "<br\\s*/?>", with: " ", options: .caseInsensitive)
+        while let r = t.range(of: "<[^>]+>", options: .regularExpression) {
+            t.replaceSubrange(r, with: "")
+        }
+        return t
     }
 
     // MARK: - 辅助

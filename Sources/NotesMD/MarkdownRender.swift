@@ -254,25 +254,53 @@ extension MarkdownRenderer {
         }
         let padX: CGFloat = 8, padY: CGFloat = 6
 
-        // 1) 列宽：按单元格单行自然宽度取列最大值，限制上限后整体压缩/拉伸到 contentWidth
+        // 1) 列宽分配：
+        //    natural[c] = 列内最宽单元格单行宽度（ceil+1pt 余量，避免临界宽度下被挤成两行）
+        //    minUnit[c] = 列内最长不可断片段宽度（CJK/全角单字可断行，连续西文/数字不可断）
+        //    超宽时不再等比压缩所有列（会把「序号」这类短列挤到换行）：
+        //    第一阶段只压缩有「可换行余量」的宽列（文本宽 > 3 个汉字的不保护），
+        //    短列（序号、数量等）保持单行；仍放不下时第二阶段连同短列一起压，
+        //    最后 20pt 硬下限兜底。每列压到 minW 为止，压满一轮后重新分配。
         var natural = [CGFloat](repeating: 24, count: colCount)
+        var minUnit = [CGFloat](repeating: 0, count: colCount)
         for (ri, row) in norm.enumerated() {
             let f = ri == 0 ? headFont : font
             for (c, cell) in row.enumerated() {
                 let plain = NSAttributedString(string: cell, attributes: [.font: f])
-                natural[c] = max(natural[c], plain.size().width)
+                natural[c] = max(natural[c], ceil(plain.size().width) + 1)
+                minUnit[c] = max(minUnit[c], minUnitWidth(cell, font: f))
             }
         }
         let maxCol = contentWidth * 0.6
         var colW = natural.map { min(max($0 + padX * 2, 32), maxCol) }
+        let minW = minUnit.map { max($0 + padX * 2, 24) }
         let avail = max(contentWidth, CGFloat(colCount) * 36)
         var total = colW.reduce(0, +)
         if total > avail {
-            let scale = avail / total
-            colW = colW.map { max($0 * scale, 20) }
+            // 短列保护：内容不超过 3 个汉字宽度的列优先保持单行（如「序号」）
+            let protected = colW.map { $0 - padX * 2 <= 36 }
+            var deficit = total - avail
+            func shrink(_ flex: [Int]) {
+                for _ in 0...colCount {
+                    guard deficit > 0.25 else { return }
+                    let slackSum = flex.reduce(0) { $0 + max(colW[$1] - minW[$1], 0) }
+                    guard slackSum > 0.25 else { return }
+                    let ratio = deficit / slackSum
+                    for c in flex {
+                        let s = max(colW[c] - minW[c], 0)
+                        colW[c] = max(colW[c] - min(s * ratio, s), minW[c])
+                    }
+                    deficit = colW.reduce(0, +) - avail
+                }
+            }
+            shrink((0..<colCount).filter { !protected[$0] })
+            shrink(Array(0..<colCount))
             total = colW.reduce(0, +)
         }
-        if total < avail {
+        if total > avail + 0.25 {
+            let scale = avail / total
+            colW = colW.map { max($0 * scale, 20) }
+        } else if total < avail {
             let scale = avail / total
             colW = colW.map { $0 * scale }
         }
@@ -373,7 +401,47 @@ extension MarkdownRenderer {
         return p
     }
 
-    /// 内联语法 -> 富文本：行内代码 > 图片 > 加粗 > 斜体 > 删除线 > 链接
+    /// 列最小宽度依据：列内最长「不可断」片段。
+    /// CJK/全角字符允许在字符间断行（单字即一个片段）；
+    /// 连续的西文、数字、标点视为整体不可断（如 "Z41H-16C"、"100"）。
+    static func minUnitWidth(_ text: String, font: NSFont) -> CGFloat {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        var maxW: CGFloat = 0
+        var run = ""
+        func flush() {
+            if run.isEmpty { return }
+            maxW = max(maxW, NSAttributedString(string: run, attributes: attrs).size().width)
+            run = ""
+        }
+        for s in text.unicodeScalars {
+            if isBreakableCJK(s) {
+                flush()
+                maxW = max(maxW, NSAttributedString(string: String(s), attributes: attrs).size().width)
+            } else {
+                run.unicodeScalars.append(s)
+            }
+        }
+        flush()
+        return maxW
+    }
+
+    private static func isBreakableCJK(_ s: Unicode.Scalar) -> Bool {
+        let v = s.value
+        return (0x1100...0x115F).contains(v)      // 谚文 Jamo
+            || (0x2E80...0x303E).contains(v)      // 部首/康熙部首/CJK 符号
+            || (0x3041...0x33FF).contains(v)      // 平假名/片假名/注音/兼容符号
+            || (0x3400...0x4DBF).contains(v)      // CJK 扩展 A
+            || (0x4E00...0x9FFF).contains(v)      // CJK 统一汉字
+            || (0xA000...0xA4CF).contains(v)      // 彝文
+            || (0xAC00...0xD7A3).contains(v)      // 谚文音节
+            || (0xF900...0xFAFF).contains(v)      // CJK 兼容汉字
+            || (0xFE30...0xFE4F).contains(v)      // CJK 兼容形式
+            || (0xFF00...0xFF60).contains(v)      // 全角字符
+            || (0xFFE0...0xFFE6).contains(v)      // 全角符号
+            || (0x20000...0x3FFFD).contains(v)    // CJK 扩展 B 及以后
+    }
+
+    /// 内联语法 -> 富文本：行内代码 > 图片 > 加粗 > 斜体 > 删除线 > 链接 > 内联 HTML 标签
     static func attributedInline(_ raw: String, base: [NSAttributedString.Key: Any],
                                  contentWidth: CGFloat = 720,
                                  onImageLoaded: (() -> Void)? = nil) -> NSAttributedString {
@@ -388,7 +456,9 @@ extension MarkdownRenderer {
                       m.range.location != NSNotFound else { return }
                 var groups: [String] = []
                 for g in 1..<m.numberOfRanges {
-                    groups.append((rest as NSString).substring(with: m.range(at: g)))
+                    let r = m.range(at: g)
+                    // 可选分组未命中时为 {NSNotFound, 0}，占位空串保持下标对齐
+                    groups.append(r.location == NSNotFound ? "" : (rest as NSString).substring(with: r))
                 }
                 if let cur = best {
                     if m.range.location < cur.loc || (m.range.location == cur.loc && kind < cur.kind) {
@@ -400,12 +470,43 @@ extension MarkdownRenderer {
             }
             consider(#"(\\)([\\`*_{}\[\]()#+.!>~-])"#, kind: 0)
             consider(#"`([^`]+)`"#, kind: 1)
-            consider(#"!\[([^\]]*)\]\(([^)\s]+)\)"#, kind: 2)
+            consider(#"!\[([^\]]*)\]\(([^)\s]+)\)(\{[^}]*\})?"#, kind: 2)
             consider(#"(\*\*|__)(.+?)\1"#, kind: 3)
             consider(#"(\*|_)([^*_]+?)\1"#, kind: 4)
             consider(#"~~(.+?)~~"#, kind: 5)
             consider(#"<((?:https?|ftp)://[^<>\s]+)>"#, kind: 6)
             consider(#"\[([^\]]+)\]\(([^)\s]+)\)"#, kind: 7)
+
+            let tag = HtmlScanner.firstTag(in: rest)
+
+            // HTML 注释 <!-- ... -->：整段跳过
+            let nsRest = rest as NSString
+            let cOpen = nsRest.range(of: "<!--")
+            if cOpen.location != NSNotFound {
+                let cClose = nsRest.range(of: "-->", range: NSRange(
+                    location: cOpen.location + 4, length: nsRest.length - cOpen.location - 4))
+                if cClose.location != NSNotFound,
+                   (best == nil || cOpen.location < best!.loc),
+                   (tag == nil || cOpen.location < tag!.range.location) {
+                    let prefix = nsRest.substring(to: cOpen.location)
+                    if !prefix.isEmpty {
+                        result.append(NSAttributedString(string: prefix, attributes: base))
+                    }
+                    rest = nsRest.substring(from: cClose.location + 3)
+                    continue
+                }
+            }
+
+            // 内联 HTML 标签：比任何 Markdown 语法更靠前时先处理
+            if let tag = tag,
+               best == nil || tag.range.location < best!.loc {
+                let (out, next) = renderHTMLTag(tag, rest: rest, base: base,
+                                                contentWidth: contentWidth,
+                                                onImageLoaded: onImageLoaded)
+                result.append(out)
+                rest = next
+                continue
+            }
 
             guard let b = best else {
                 if !rest.isEmpty {
@@ -432,29 +533,15 @@ extension MarkdownRenderer {
                 result.append(NSAttributedString(string: b.groups[0], attributes: attrs))
             case 2:
                 // 图床图片：以文本附件插入；未命中缓存时先放占位图，下载完成后整体重渲染
+                // 支持尾部属性 {align=center width=70%}
                 let alt = b.groups[0]
-                if let url = ImageStore.url(from: b.groups[1]) {
-                    let maxWidth = max(contentWidth, 120)
-                    let attachment = NSTextAttachment()
-                    if let img = ImageStore.shared.cached(url) {
-                        attachment.image = ImageStore.scaled(
-                            img, toSize: ImageStore.fitSize(img.size, maxWidth: maxWidth, maxHeight: 560))
-                    } else {
-                        attachment.image = ImageStore.placeholder(
-                            size: NSSize(width: min(240, maxWidth), height: 120))
-                        ImageStore.shared.image(for: url) { img in
-                            if img != nil { onImageLoaded?() }
-                        }
-                    }
-                    result.append(NSAttributedString(attachment: attachment))
-                    if !alt.isEmpty {
-                        var caption = attrs
-                        if let f = caption[.font] as? NSFont {
-                            caption[.font] = NSFont.systemFont(ofSize: max(f.pointSize - 3, 10))
-                        }
-                        caption[.foregroundColor] = NSColor.secondaryLabelColor
-                        result.append(NSAttributedString(string: "\n" + alt, attributes: caption))
-                    }
+                let imageAttrs: ImageAttributes? = b.groups.count >= 3 && !b.groups[2].isEmpty
+                    ? ImageAttrParser.parse(String(b.groups[2].dropFirst().dropLast()))
+                    : nil
+                if let imgAttr = makeImage(urlText: b.groups[1], alt: alt, attrs: attrs,
+                                           imageAttrs: imageAttrs,
+                                           contentWidth: contentWidth, onImageLoaded: onImageLoaded) {
+                    result.append(imgAttr)
                 } else {
                     result.append(NSAttributedString(string: "![](" + b.groups[1] + ")", attributes: attrs))
                 }
@@ -487,5 +574,231 @@ extension MarkdownRenderer {
             rest = (rest as NSString).substring(from: b.end)
         }
         return result
+    }
+
+    /// 渲染一个内联 HTML 标签，返回 (rest 起点至标签结束处的渲染结果, 剩余 rest)
+    private static func renderHTMLTag(_ tag: HtmlTag, rest: String,
+                                      base: [NSAttributedString.Key: Any],
+                                      contentWidth: CGFloat,
+                                      onImageLoaded: (() -> Void)?) -> (NSAttributedString, String) {
+        let ns = rest as NSString
+        let tagEnd = tag.range.location + tag.range.length
+        let out = NSMutableAttributedString()
+        let prefix = ns.substring(to: tag.range.location)
+        if !prefix.isEmpty {
+            out.append(NSAttributedString(string: prefix, attributes: base))
+        }
+        let name = tag.name
+        func closeRange() -> (start: Int, end: Int)? {
+            HtmlScanner.firstClosingTag(named: name, in: rest, from: tagEnd)
+        }
+        func lit() -> (NSAttributedString, String) {
+            (NSAttributedString(string: ns.substring(with: tag.range), attributes: base),
+             ns.substring(from: tagEnd))
+        }
+
+        if tag.closing {
+            // 无配对的孤立闭合标签：原样保留
+            return lit()
+        }
+        switch name {
+        case "br":
+            out.append(NSAttributedString(string: "\n", attributes: base))
+            return (out, ns.substring(from: tagEnd))
+        case "wbr":
+            return (out, ns.substring(from: tagEnd))
+        case "img":
+            guard let src = tag.attr("src") else { return lit() }
+            var ia = ImageAttributes()
+            if let al = tag.attr("align")?.lowercased() {
+                switch al {
+                case "center": ia.align = .center
+                case "right": ia.align = .right
+                case "left": ia.align = .left
+                default: break
+                }
+            }
+            if let w = tag.attr("width"), let (v, pct) = ImageAttrParser.parseSize(w) {
+                ia.width = v; ia.widthIsPercent = pct
+            }
+            if let h = tag.attr("height"), let (v, pct) = ImageAttrParser.parseSize(h) {
+                ia.height = v; ia.heightIsPercent = pct
+            }
+            if let imgAttr = makeImage(urlText: src, alt: tag.attr("alt") ?? "",
+                                       attrs: base,
+                                       imageAttrs: ia.isEmpty ? nil : ia,
+                                       contentWidth: contentWidth,
+                                       onImageLoaded: onImageLoaded) {
+                out.append(imgAttr)
+            }
+            return (out, ns.substring(from: tagEnd))
+        case "a":
+            if let close = closeRange() {
+                var la = base
+                la[.foregroundColor] = NSColor.linkColor
+                la[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                let inner = ns.substring(with: NSRange(location: tagEnd, length: close.start - tagEnd))
+                out.append(attributedInline(inner, base: la, contentWidth: contentWidth,
+                                            onImageLoaded: onImageLoaded))
+                return (out, ns.substring(from: close.end))
+            }
+            return lit()
+        case "script", "style", "head", "meta", "link", "title", "noscript":
+            if let close = closeRange() {
+                return (out, ns.substring(from: close.end))
+            }
+            return lit()
+        default:
+            break
+        }
+
+        // 计算修改后的属性；nil = 透明标签（p/div/section 等，不改样式）
+        var styled: [NSAttributedString.Key: Any]?
+        switch name {
+        case "b", "strong":
+            var a = base
+            if let f = a[.font] as? NSFont {
+                a[.font] = NSFontManager.shared.convert(f, toHaveTrait: .boldFontMask)
+            }
+            styled = a
+        case "i", "em":
+            var a = base
+            if let f = a[.font] as? NSFont {
+                a[.font] = NSFontManager.shared.convert(f, toHaveTrait: .italicFontMask)
+            }
+            styled = a
+        case "u", "ins":
+            var a = base
+            a[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            styled = a
+        case "s", "strike", "del":
+            var a = base
+            a[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+            styled = a
+        case "sub":
+            var a = base
+            if let f = a[.font] as? NSFont {
+                a[.font] = HtmlStyle.withSize(f, f.pointSize * 0.75)
+                a[.baselineOffset] = -f.pointSize * 0.2
+            }
+            styled = a
+        case "sup":
+            var a = base
+            if let f = a[.font] as? NSFont {
+                a[.font] = HtmlStyle.withSize(f, f.pointSize * 0.75)
+                a[.baselineOffset] = f.pointSize * 0.3
+            }
+            styled = a
+        case "mark":
+            var a = base
+            a[.backgroundColor] = NSColor.systemYellow.withAlphaComponent(0.45)
+            styled = a
+        case "code":
+            var a = base
+            if let f = a[.font] as? NSFont {
+                a[.font] = NSFont.monospacedSystemFont(ofSize: max(f.pointSize - 1.5, 10), weight: .regular)
+            }
+            styled = a
+        case "small":
+            var a = base
+            if let f = a[.font] as? NSFont { a[.font] = HtmlStyle.withSize(f, f.pointSize * 0.85) }
+            styled = a
+        case "span":
+            if let style = tag.attr("style") {
+                var a = base
+                for (k, v) in HtmlStyle.attributes(fromCSS: style, baseFont: base[.font] as? NSFont) {
+                    a[k] = v
+                }
+                styled = a
+            }
+        case "font":
+            var a = base
+            var changed = false
+            if let c = tag.attr("color"), let col = HtmlStyle.color(c) {
+                a[.foregroundColor] = col
+                changed = true
+            }
+            if let sz = tag.attr("size"), let n = Int(sz), (1...7).contains(n) {
+                let sizes: [CGFloat] = [12, 14, 16, 18, 20, 24, 32]
+                if let f = a[.font] as? NSFont {
+                    a[.font] = HtmlStyle.withSize(f, sizes[n - 1])
+                    changed = true
+                }
+            }
+            styled = changed ? a : base
+        default:
+            break
+        }
+        let effective = styled ?? base
+
+        if let close = closeRange() {
+            let inner = ns.substring(with: NSRange(location: tagEnd, length: close.start - tagEnd))
+            out.append(attributedInline(inner, base: effective, contentWidth: contentWidth,
+                                        onImageLoaded: onImageLoaded))
+            return (out, ns.substring(from: close.end))
+        }
+        if styled != nil {
+            // 没有闭合标签：样式应用到剩余文字
+            out.append(attributedInline(ns.substring(from: tagEnd), base: effective,
+                                        contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+            return (out, "")
+        }
+        return lit()
+    }
+
+    /// 插入图片附件（含 alt 说明文字）；地址无法解析时返回 nil。
+    /// imageAttrs：{align=center width=70%} 样式属性（尺寸 / 对齐）
+    private static func makeImage(urlText: String, alt: String,
+                                  attrs: [NSAttributedString.Key: Any],
+                                  imageAttrs: ImageAttributes? = nil,
+                                  contentWidth: CGFloat,
+                                  onImageLoaded: (() -> Void)?) -> NSAttributedString? {
+        guard let url = ImageStore.url(from: urlText) else { return nil }
+        let maxWidth = max(contentWidth, 120)
+        let attachment = NSTextAttachment()
+        if let img = ImageStore.shared.cached(url) {
+            let size = imageAttrs == nil
+                ? ImageStore.fitSize(img.size, maxWidth: maxWidth, maxHeight: 560)
+                : ImageAttrParser.displaySize(imgSize: img.size, contentMax: maxWidth,
+                                              imageAttrs: imageAttrs)
+            attachment.image = ImageStore.scaled(img, toSize: size)
+        } else {
+            var phSize = NSSize(width: min(240, maxWidth), height: 120)
+            if let w = imageAttrs?.width {
+                let base: CGFloat = imageAttrs!.widthIsPercent ? maxWidth : 360
+                phSize = NSSize(width: max(w > 0 && imageAttrs!.widthIsPercent ? base * w : w, 40),
+                                height: 120)
+            }
+            attachment.image = ImageStore.placeholder(size: phSize)
+            ImageStore.shared.image(for: url) { img in
+                if img != nil { onImageLoaded?() }
+            }
+        }
+        // 对齐：图片独占一行，给图片字符与说明文字所在段落设置对齐方式
+        var alignStyle: NSMutableParagraphStyle?
+        if let align = imageAttrs?.align {
+            var ps: NSMutableParagraphStyle
+            if let existing = (attrs[.paragraphStyle] as? NSParagraphStyle)?.copy() as? NSMutableParagraphStyle {
+                ps = existing
+            } else {
+                ps = NSMutableParagraphStyle()
+            }
+            ps.alignment = align
+            alignStyle = ps
+        }
+        var out = NSMutableAttributedString(attachment: attachment)
+        if let ps = alignStyle {
+            out.addAttribute(.paragraphStyle, value: ps, range: NSRange(location: 0, length: 1))
+        }
+        if !alt.isEmpty {
+            var caption = attrs
+            if let f = caption[.font] as? NSFont {
+                caption[.font] = NSFont.systemFont(ofSize: max(f.pointSize - 3, 10))
+            }
+            caption[.foregroundColor] = NSColor.secondaryLabelColor
+            if let ps = alignStyle { caption[.paragraphStyle] = ps }
+            out.append(NSAttributedString(string: "\n" + alt, attributes: caption))
+        }
+        return out
     }
 }

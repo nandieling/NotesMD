@@ -15,6 +15,12 @@ final class CodeBlockLayoutManager: NSLayoutManager {
     /// 原生实现会一次性拿到整段可见 glyph 区间（而不是按背景属性 run 拆分），
     /// 所以这里自己枚举带代码块底色的区间，逐块按行片段整体填充
     override func drawBackground(forGlyphRange glyphs: NSRange, at point: NSPoint) {
+        func dbg(_ s: String) {
+            guard ProcessInfo.processInfo.environment["NMD_LM_DEBUG"] == "1" else { return }
+            if let h = FileHandle(forWritingAtPath: "/tmp/lm-debug.log") {
+                h.seekToEndOfFile(); h.write((s + "\n").data(using: .utf8)!); h.closeFile()
+            }
+        }
         guard let storage = textStorage, storage.length > 0 else {
             return super.drawBackground(forGlyphRange: glyphs, at: point)
         }
@@ -37,16 +43,23 @@ final class CodeBlockLayoutManager: NSLayoutManager {
         // 其余背景（如有）仍交给原生填充
         super.drawBackground(forGlyphRange: glyphs, at: point)
         guard !blocks.isEmpty else { return }
-
+        let base = boundingRect(forGlyphRange: glyphs, in: container)
+        dbg("call glyphs=\(glyphs) charRange=\(charRange) point=\(point) base=\(base) blocks=\(blocks.count)")
+        if ProcessInfo.processInfo.environment["NMD_LM_DEBUG"] == "1" {
+            NSColor.red.setFill()
+            NSRect(x: 0, y: 0, width: 2000, height: 2000).fill()
+        }
         // point = glyphRange 整体 bounding rect 左上角（视图坐标）；
         // 容器坐标统一换算：view = point + (container - baseBounding.origin)
-        let base = boundingRect(forGlyphRange: glyphs, in: container)
         func vx(_ x: CGFloat) -> CGFloat { point.x + (x - base.minX) }
         func vy(_ y: CGFloat) -> CGFloat { point.y + (y - base.minY) }
 
         let allRange = NSRange(location: 0, length: storage.length)
         for block in blocks {
             guard block.range.location < storage.length else { continue }
+            if ProcessInfo.processInfo.environment["NMD_LM_DEBUG"] == "1" {
+                NSColor.magenta.setFill(); NSRect(x: 0, y: 40, width: 200, height: 12).fill()   // P1 outer loop top
+            }
             // 左缘 = 行片段左缘 + headIndent：空行（无字形）也能与非空行对齐，
             // 引用内的代码块不会向左凸出缩进
             let headIndent = (storage.attribute(.paragraphStyle, at: block.range.location,
@@ -54,6 +67,9 @@ final class CodeBlockLayoutManager: NSLayoutManager {
                               as? NSParagraphStyle)?.headIndent ?? 0
             let subGlyphRange = glyphRange(forCharacterRange: block.range, actualCharacterRange: nil)
             guard subGlyphRange.location != NSNotFound else { continue }
+            if ProcessInfo.processInfo.environment["NMD_LM_DEBUG"] == "1" {
+                NSColor.magenta.setFill(); NSRect(x: 0, y: 60, width: 200, height: 12).fill()   // P2 after glyphRange
+            }
             // 逐行片段收集：行片段矩形 + 该行实际内容右缘。
             // 注意 boundingRect(forGlyphRange:in:) 实测返回整行容器宽度（非紧致包围盒），
             // 这里用 lineFragmentUsedRect（容器坐标系、紧贴实际文本）取每行右缘
@@ -69,6 +85,8 @@ final class CodeBlockLayoutManager: NSLayoutManager {
             guard !fragments.isEmpty else { continue }
             // 以块内最宽一行为右边界：左边做背景填充，右边（无代码的空白）不填充
             let blockMaxX = fragments.map { $0.maxX }.max() ?? 0
+            let firstFrag = fragments[0]
+            dbg("block \(block.range) headIndent=\(headIndent) frags=\(fragments.count) firstFragRect=\(firstFrag.rect) blockMaxX=\(blockMaxX) fill0=[\(vx(firstFrag.rect.minX + headIndent)),\(vy(firstFrag.rect.minY)) w=\(min(firstFrag.rect.maxX, blockMaxX) - firstFrag.rect.minX - headIndent)]")
             block.color.setFill()
             for (i, frag) in fragments.enumerated() {
                 let leftX = vx(frag.rect.minX + headIndent)
@@ -79,7 +97,14 @@ final class CodeBlockLayoutManager: NSLayoutManager {
                     ? vy(fragments[i + 1].rect.minY)
                     : vy(frag.rect.maxY)
                 guard bottomY > topY, rightX > leftX else { continue }
-                NSRect(x: leftX, y: topY, width: rightX - leftX, height: bottomY - topY).fill()
+                let fillRect = NSRect(x: leftX, y: topY, width: rightX - leftX, height: bottomY - topY)
+                dbg("fill rect=\(fillRect) flipped=\(NSGraphicsContext.current?.isFlipped ?? false)")
+                if ProcessInfo.processInfo.environment["NMD_LM_DEBUG"] == "1" {
+                    NSColor.blue.setFill()
+                    NSColor.green.setFill()
+                    NSRect(x: 0, y: 300, width: 2000, height: 100).fill()
+                }
+                fillRect.fill()
             }
         }
     }

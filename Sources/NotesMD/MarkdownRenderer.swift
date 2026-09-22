@@ -113,10 +113,20 @@ enum MarkdownRenderer {
             return "\u{1}\(stash.count - 1)\u{1}"
         }
 
+        // HTML 注释 <!-- ... -->：整段移除
+        let noComments = replaceRegex(#"<!--.*?-->"#, in: raw) { _ in "" }
         // 自动链接 <https://...>（须在 escape 之前，避免 < > 变成 &lt; &gt;）
-        var s = replaceRegex(#"<((?:https?|ftp)://[^<>\s]+)>"#, in: raw) { m in
-            let url = (raw as NSString).substring(with: m.range(at: 1))
+        var s = replaceRegex(#"<((?:https?|ftp)://[^<>\s]+)>"#, in: noComments) { m in
+            let url = (noComments as NSString).substring(with: m.range(at: 1))
             return stashHTML("<a href=\"\(url)\">\(url)</a>")
+        }
+        // 内联 HTML 标签（b/i/u/s/br/span/font/a/img 等）：先 stash 成等价 HTML，
+        // 避免被 escape 转义；内部文字仍走后续 Markdown 行内处理
+        while let tag = HtmlScanner.firstTag(in: s) {
+            let ph = stashHTML(htmlTagToHTML(tag))
+            let ns = s as NSString
+            s = ns.substring(to: tag.range.location) + ph
+                + ns.substring(from: tag.range.location + tag.range.length)
         }
         s = escape(s)
         // 反斜杠转义：\\* \\` \\[ 等还原为普通字符（先保护，避免被再加格式）
@@ -127,11 +137,33 @@ enum MarkdownRenderer {
         s = replaceRegex(#"`([^`]+)`"#, in: s) { m in
             stashHTML("<code>" + s.substring(m.range(at: 1)) + "</code>")
         }
-        // 图床图片 ![](url)（先于链接处理，避免被拆成 "!" + 空链接）
-        s = replaceRegex(#"!\[([^\]]*)\]\(([^)\s]+)\)"#, in: s) { m in
+        // 图床图片 ![](url)，支持 {align=center width=70%} 属性
+        s = replaceRegex(#"!\[([^\]]*)\]\(([^)\s]+)\)(\{[^}]*\})?"#, in: s) { m in
             let alt = s.substring(m.range(at: 1))
             let url = s.substring(m.range(at: 2))
-            return stashHTML("<img src=\"\(url)\" alt=\"\(alt)\">")
+            var img = "<img src=\"\(url)\" alt=\"\(alt)\""
+            let braceRange = m.range(at: 3)
+            if braceRange.location != NSNotFound {
+                let attrs = ImageAttrParser.parse(String(s.substring(braceRange).dropFirst().dropLast()))
+                if let w = attrs.width {
+                    let val = attrs.widthIsPercent ? "\(Int((w * 100).rounded()))%" : "\(Int(w.rounded()))px"
+                    img += " width=\"\(val)\""
+                }
+                if let h = attrs.height {
+                    let val = attrs.heightIsPercent ? "\(Int((h * 100).rounded()))%" : "\(Int(h.rounded()))px"
+                    img += " height=\"\(val)\""
+                }
+                if let a = attrs.align {
+                    let val: String
+                    switch a {
+                    case .center: val = "center"
+                    case .right: val = "right"
+                    default: val = "left"
+                    }
+                    img += " align=\"\(val)\""
+                }
+            }
+            return stashHTML(img + ">")
         }
         // 加粗
         s = replaceRegex(#"(\*\*|__)(.+?)\1"#, in: s) { m in
@@ -298,6 +330,43 @@ enum MarkdownRenderer {
         }
         result += ns.substring(from: last)
         return result
+    }
+}
+
+// MARK: - 内联 HTML 标签 -> 备忘录等价 HTML
+
+extension MarkdownRenderer {
+
+    private static func htmlTagToHTML(_ tag: HtmlTag) -> String {
+        if tag.closing {
+            switch tag.name {
+            case "b": return "</strong>"
+            case "i": return "</em>"
+            case "u", "ins", "mark", "font": return "</span>"
+            case "s", "strike": return "</del>"
+            default: return tag.raw
+            }
+        }
+        switch tag.name {
+        case "b": return "<strong>"
+        case "i": return "<em>"
+        case "u", "ins": return "<span style=\"text-decoration: underline\">"
+        case "s", "strike": return "<del>"
+        case "mark": return "<span style=\"background-color: #FFF176\">"
+        case "br": return "<br>"
+        case "wbr": return ""
+        case "font":
+            var st = ""
+            if let c = tag.attr("color") { st += "color: \(c);" }
+            if let sz = tag.attr("size"), let n = Int(sz), (1...7).contains(n) {
+                let px: [CGFloat] = [12, 14, 16, 18, 20, 24, 32]
+                st += "font-size: \(Int(px[n - 1]))px;"
+            }
+            return st.isEmpty ? "<span>" : "<span style=\"\(st)\">"
+        default:
+            // strong/em/del/sub/sup/code/small/a/img/span 及未知标签：原样透传
+            return tag.raw
+        }
     }
 }
 
