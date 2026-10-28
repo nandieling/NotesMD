@@ -49,6 +49,17 @@ final class ImageStore {
         cache.object(forKey: url as NSURL)
     }
 
+    /// 同步读取本地图片并写入缓存（「粘贴进备忘录」等需要同步拿到图片数据的场景）。
+    /// 远程 URL 直接返回 false；已缓存返回 true。
+    @discardableResult
+    func loadLocalSync(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        if cached(url) != nil { return true }
+        guard let img = NSImage(contentsOf: url) else { return false }
+        cache.setObject(img, forKey: url as NSURL)
+        return true
+    }
+
     /// 异步获取图片（已缓存则立即回调；同一 URL 的并发请求只下载一次）。回调始终在主线程。
     func image(for url: URL, completion: @escaping (NSImage?) -> Void) {
         if let img = cache.object(forKey: url as NSURL) {

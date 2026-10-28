@@ -238,16 +238,49 @@ enum HtmlStyle {
         return NSFont(descriptor: f.fontDescriptor.withSize(s), size: s) ?? f
     }
 
-    /// HTML 表格 / 列表等场景：把实体转回普通字符
+    /// HTML 表格 / 列表 / Markdown 正文共用：把实体转回普通字符。
+    /// 覆盖常见命名实体与数字实体（&#39; / &#x27;）；未知实体原样保留。
     static func unescapeEntities(_ s: String) -> String {
-        s.replacingOccurrences(of: "&nbsp;", with: " ", options: .caseInsensitive)
-         .replacingOccurrences(of: "&amp;", with: "&", options: .caseInsensitive)
-         .replacingOccurrences(of: "&lt;", with: "<", options: .caseInsensitive)
-         .replacingOccurrences(of: "&gt;", with: ">", options: .caseInsensitive)
-         .replacingOccurrences(of: "&quot;", with: "\"", options: .caseInsensitive)
-         .replacingOccurrences(of: "&#39;", with: "'")
-         .replacingOccurrences(of: "&apos;", with: "'", options: .caseInsensitive)
+        guard s.contains("&") else { return s }
+        guard let re = try? NSRegularExpression(
+            pattern: "&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,10});") else { return s }
+        let ns = s as NSString
+        var out = ""
+        var last = 0
+        for m in re.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
+            out += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+            last = m.range.upperBound
+            let body = ns.substring(with: m.range(at: 1))
+            let whole = ns.substring(with: m.range)
+            if body.hasPrefix("#") {
+                let digits = body.dropFirst()
+                let code = (digits.first == "x" || digits.first == "X")
+                    ? Int(digits.dropFirst(), radix: 16) : Int(digits)
+                if let c = code, c > 0, c < 0x110000, !((0xD800...0xDFFF).contains(c)),
+                   let scalar = Unicode.Scalar(c) {
+                    out.append(String(scalar))
+                } else {
+                    out += whole
+                }
+            } else {
+                out += namedEntities[body.lowercased()] ?? whole
+            }
+        }
+        out += ns.substring(from: last)
+        return out
     }
+
+    private static let namedEntities: [String: String] = [
+        "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": "\u{00A0}",
+        "copy": "\u{00A9}", "reg": "\u{00AE}", "trade": "\u{2122}",
+        "hellip": "\u{2026}", "mdash": "\u{2014}", "ndash": "\u{2013}",
+        "middot": "\u{00B7}", "bull": "\u{2022}", "laquo": "\u{00AB}", "raquo": "\u{00BB}",
+        "times": "\u{00D7}", "divide": "\u{00F7}", "deg": "\u{00B0}", "sect": "\u{00A7}",
+        "para": "\u{00B6}", "dagger": "\u{2020}", "euro": "\u{20AC}", "pound": "\u{00A3}",
+        "yen": "\u{00A5}", "cent": "\u{00A2}", "larr": "\u{2190}", "rarr": "\u{2192}",
+        "uarr": "\u{2191}", "darr": "\u{2193}", "harr": "\u{2194}", "ne": "\u{2260}",
+        "le": "\u{2264}", "ge": "\u{2265}", "equiv": "\u{2261}", "plusmn": "\u{00B1}"
+    ]
 }
 
 // MARK: - 图片属性  ![](url){align=center width=70%}

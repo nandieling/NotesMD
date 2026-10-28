@@ -19,7 +19,9 @@ enum MarkdownRenderer {
         case .heading(let level, let text):
             return "<h\(level)>" + inline(text) + "</h\(level)>"
         case .paragraph(let lines):
-            return "<p>" + lines.map(inline).joined(separator: "<br>") + "</p>"
+            // 行尾反斜杠是硬换行标记，输出时不显示
+            return "<p>" + lines.map { inline(hardBreakMarkStripped($0)) }
+                .joined(separator: "<br>") + "</p>"
         case .code(_, let code):
             return "<pre><code>" + code.map(escape).joined(separator: "\\n") + "</code></pre>"
         case .quote(let blocks):
@@ -43,7 +45,8 @@ enum MarkdownRenderer {
             var paraLines: [String] = []
             func flushPara() {
                 if !paraLines.isEmpty {
-                    body.append("<p>" + paraLines.map(inline).joined(separator: "<br>") + "</p>")
+                    body.append("<p>" + paraLines.map { inline(hardBreakMarkStripped($0)) }
+                        .joined(separator: "<br>") + "</p>")
                     paraLines = []
                 }
             }
@@ -66,13 +69,19 @@ enum MarkdownRenderer {
         let startAttr = (list.ordered && list.start != 1) ? " start=\"\(list.start)\"" : ""
         var out = "<\(tag)\(startAttr)>"
         for item in list.items {
-            var content = ""
-            if let task = item.task {
-                content += task == 1 ? "☑ " : "☐ "
+            var prefix = ""
+            if let task = item.task { prefix = task == 1 ? "☑ " : "☐ " }
+            var parts: [String] = []
+            for part in item.parts {
+                switch part {
+                case .text(let text):
+                    parts.append(inline(text))
+                case .code(_, let lines):
+                    parts.append("<pre><code>" + lines.map(escape).joined(separator: "\\n") + "</code></pre>")
+                }
             }
-            content += item.text.map(inline).joined(separator: "<br>")
-            content += item.children.map(htmlList).joined()
-            out += "<li>" + content + "</li>"
+            out += "<li>" + prefix + parts.joined(separator: "<br>")
+                + item.children.map(htmlList).joined() + "</li>"
         }
         out += "</\(tag)>"
         return out
@@ -134,6 +143,14 @@ enum MarkdownRenderer {
             stashHTML(s.substring(m.range(at: 2)))
         }
         // 行内代码（先保护，避免内部被再加格式）
+        // 反引号定界长度 3 → 2 → 1 依次处理，``` a `` b ``` 这类才能正确配对
+        s = replaceRegex(#"```(.+?)```"#, in: s) { m in
+            return stashHTML("<code>" + codeContent(s.substring(m.range(at: 1))) + "</code>")
+        }
+        // 双反引号先走一遍：`` code with ` backtick ``
+        s = replaceRegex(#"``(.+?)``"#, in: s) { m in
+            return stashHTML("<code>" + codeContent(s.substring(m.range(at: 1))) + "</code>")
+        }
         s = replaceRegex(#"`([^`]+)`"#, in: s) { m in
             stashHTML("<code>" + s.substring(m.range(at: 1)) + "</code>")
         }
@@ -165,32 +182,52 @@ enum MarkdownRenderer {
             }
             return stashHTML(img + ">")
         }
+        // 粗斜体（先于加粗，否则 ***x*** 会残留星号）
+        s = replaceRegex(#"(\*\*\*|___)([^*_]+?)\1"#, in: s) { m in
+            stashHTML("<strong><em>" + s.substring(m.range(at: 2)) + "</em></strong>")
+        }
         // 加粗
         s = replaceRegex(#"(\*\*|__)(.+?)\1"#, in: s) { m in
             stashHTML("<strong>" + s.substring(m.range(at: 2)) + "</strong>")
         }
         // 斜体
-        s = replaceRegex(#"(\*|_)([^*_]+?)\1"#, in: s) { m in
-            stashHTML("<em>" + s.substring(m.range(at: 2)) + "</em>")
+        s = replaceRegex(#"\*([^*\n]+?)\*"#, in: s) { m in
+            stashHTML("<em>" + s.substring(m.range(at: 1)) + "</em>")
+        }
+        // 下划线斜体：词内下划线（snake_case_name）不作强调
+        s = replaceRegex(#"(?<![A-Za-z0-9_])_([^_\n]+?)_(?![A-Za-z0-9])"#, in: s) { m in
+            stashHTML("<em>" + s.substring(m.range(at: 1)) + "</em>")
         }
         // 删除线
         s = replaceRegex(#"~~(.+?)~~"#, in: s) { m in
             stashHTML("<del>" + s.substring(m.range(at: 1)) + "</del>")
         }
         // 链接
-        s = replaceRegex(#"\[([^\]]+)\]\(([^)\s]+)\)"#, in: s) { m in
+        // 允许尾部标题：[文本](url "标题")
+        s = replaceRegex(#"\[([^\]]+)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)"#, in: s) { m in
             let text = s.substring(m.range(at: 1))
             let url = s.substring(m.range(at: 2))
             return stashHTML("<a href=\"\(url)\">\(text)</a>")
         }
-        // 还原占位符
-        s = replaceRegex("\u{1}(\\d+)\u{1}", in: s) { m in
-            if let idx = Int(s.substring(m.range(at: 1))), idx < stash.count {
-                return stash[idx]
+        // 还原占位符：占位符可能层层嵌套（如 ~~**x**~~ 里外层 HTML 包住内层），逐层展开
+        for _ in 0..<12 {
+            guard s.contains("\u{1}") else { break }
+            s = replaceRegex("\u{1}(\\d+)\u{1}", in: s) { m in
+                if let idx = Int(s.substring(m.range(at: 1))), idx < stash.count {
+                    return stash[idx]
+                }
+                return ""
             }
-            return ""
         }
+        s = s.replacingOccurrences(of: "\u{1}", with: "")
         return s
+    }
+
+    /// 行内代码内容：首尾各一个空格会被去掉（CommonMark）
+    private static func codeContent(_ text: String) -> String {
+        guard text.count >= 2, text.hasPrefix(" "), text.hasSuffix(" "),
+              !text.allSatisfy({ $0 == " " }) else { return text }
+        return String(text.dropFirst().dropLast())
     }
 
     /// 提取第一个 ATX 标题作为备忘录标题
@@ -285,9 +322,11 @@ enum MarkdownRenderer {
     }
 
     static func isHorizontalRule(_ t: String) -> Bool {
-        guard t.count >= 3 else { return false }
-        let set = Set(t)
-        return set.isSubset(of: Set("-")) || set.isSubset(of: Set("*")) || set.isSubset(of: Set("_"))
+        // 只由同一种标记（可夹空格）组成且至少三个：---、***、___、- - -、*  *  *
+        let marks = Set(t.filter { !$0.isWhitespace })
+        guard marks.count == 1, let mark = marks.first,
+              mark == "-" || mark == "*" || mark == "_" else { return false }
+        return t.filter { $0 == mark }.count >= 3
     }
 
     static func isUnorderedItem(_ line: String) -> Bool {
@@ -311,7 +350,9 @@ enum MarkdownRenderer {
         guard let m = re.firstMatch(in: input, range: NSRange(location: 0, length: ns.length)) else { return nil }
         var groups: [String] = []
         for g in 1..<m.numberOfRanges {
-            groups.append(ns.substring(with: m.range(at: g)))
+            let r = m.range(at: g)
+            // 可选分组未参与匹配时为 {NSNotFound, 0}，占位空串避免调用方越界
+            groups.append(r.location == NSNotFound ? "" : ns.substring(with: r))
         }
         return groups
     }

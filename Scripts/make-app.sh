@@ -62,5 +62,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$APP"
+# 优先用 Apple Development 证书签名：TCC 权限按「bundle id + 团队」锚定，
+# 重新构建/替换应用后权限不失效（ad-hoc 签名每次 cdhash 变化都会要求重新授权）
+IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development|Apple Distribution|Developer ID/{print $2; exit}')
+if [ -n "$IDENTITY" ]; then
+    codesign --force --sign "$IDENTITY" "$APP"
+    echo "签名：$IDENTITY"
+else
+    codesign --force --sign - "$APP"
+    echo "签名：ad-hoc"
+fi
 echo "已生成：$APP"

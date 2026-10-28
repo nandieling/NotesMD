@@ -433,7 +433,8 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
 
         let editorScroll = makeScroll()
         editorTextView = makeTextView(forEditor: true)
-        editorTextView.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        editorTextView.font = Self.editorFont
+        editorTextView.typingAttributes = Self.editorTextAttributes
         editorTextView.delegate = self
         editorTextView.drawsBackground = false
         editorScroll.documentView = editorTextView
@@ -471,7 +472,15 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
     private func makeTextView(forEditor editor: Bool = false) -> NSTextView {
         let tv: NSTextView
         if editor {
-            tv = EditorTextView()
+            let etv = EditorTextView()
+            // 编辑区放的是 Markdown 源码，只接受纯文本：
+            // isRichText 默认 YES 时粘贴富文本会把字体/颜色/底色/段落样式一起带进来，
+            // 整区等宽排版被打散（正文混进 Times/Courier、行距忽紧忽松、残留色块）
+            etv.isRichText = false
+            etv.importsGraphics = false
+            // 与预览区同左缘（预览容器 lineFragmentPadding 已设为 0）
+            etv.textContainer?.lineFragmentPadding = 0
+            tv = etv
         } else {
             // 预览用自定义 layoutManager：代码块底色整块填充（原生只逐行填充，行间有缝）
             let storage = NSTextStorage()
@@ -658,6 +667,28 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         return types
     }()
 
+    /// 编辑区唯一字体（整区等宽，粘贴/输入都不换字体）
+    static let editorFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+
+    /// 编辑区唯一一套文字属性：等宽字体 + 默认颜色 + 统一段落样式。
+    /// Tab 停靠位固定为 4 个等宽字符宽，与 Markdown 的 4 空格缩进语义一致。
+    static let editorTextAttributes: [NSAttributedString.Key: Any] = {
+        let p = NSMutableParagraphStyle()
+        p.tabStops = []
+        p.defaultTabInterval = editorFont.maximumAdvancement.width * 4
+        return [.font: editorFont,
+                .foregroundColor: NSColor.textColor,
+                .paragraphStyle: p]
+    }()
+
+    /// 编辑区写入文本并清掉全部外来属性（调用方负责包 isProgrammaticChange）
+    private func setEditorPlainText(_ text: String) {
+        editorTextView.string = text
+        guard let storage = editorTextView.textStorage, storage.length > 0 else { return }
+        storage.setAttributes(Self.editorTextAttributes,
+                              range: NSRange(location: 0, length: storage.length))
+    }
+
     func updateTitle() {
         window?.isDocumentEdited = isDirty
         window?.title = fileURL.map { "NotesMD - \($0.lastPathComponent)" } ?? "NotesMD"
@@ -671,7 +702,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         isDirty = false
         hasPushedToNotes = false
         isProgrammaticChange = true
-        editorTextView.string = ""
+        setEditorPlainText("")
         isProgrammaticChange = false
         refreshPreview()
         updateTitle()
@@ -698,7 +729,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         isDirty = false
         hasPushedToNotes = false
         isProgrammaticChange = true
-        editorTextView.string = text
+        setEditorPlainText(text)
         isProgrammaticChange = false
         refreshPreview()
         updateTitle()
@@ -842,6 +873,16 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         let html = MarkdownRenderer.html(from: md)
         let title = MarkdownRenderer.deriveTitle(from: md) ?? "未命名备忘录"
         setStatus("正在写入备忘录…")
+        // 优先「⌘N + ⌘V」流程：本地图片随富文本以附件形式嵌入备忘录
+        if let noteID = NotesService.createNoteByPasting(markdown: md) {
+            hasPushedToNotes = true
+            NotePushCache.store(md, noteID: noteID)
+            bindNote(id: noteID, name: title, silent: true)
+            setStatus("已创建并关联备忘录「\(title)」，本地图片已嵌入，富文本也已复制到剪贴板")
+            return
+        }
+        // 回退：纯 HTML 创建（本地图片不会嵌入）
+        let pasteHint = NotesService.lastPasteFailureHint
         DispatchQueue.global(qos: .userInitiated).async {
             let result = NotesService.createNote(html: html)
             DispatchQueue.main.async {
@@ -850,7 +891,11 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
                     self.hasPushedToNotes = true
                     NotePushCache.store(md, noteID: noteID)
                     self.bindNote(id: noteID, name: title, silent: true)
-                    self.setStatus("已创建并关联备忘录「\(title)」，富文本也已复制到剪贴板")
+                    var hint = ""
+                    if !pasteHint.isEmpty {
+                        hint = "（本地图片未嵌入：\(pasteHint)，处理后可重试）"
+                    }
+                    self.setStatus("已创建并关联备忘录「\(title)」，富文本也已复制到剪贴板\(hint)")
                 case .failure(let error):
                     self.setStatus("创建失败：\(error.localizedDescription)（富文本已在剪贴板，可手动 ⌘V）")
                 }
@@ -865,6 +910,13 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         mode = .note
         let md = noteTitleMarkdown
         let html = MarkdownRenderer.html(from: md)
+        // 优先「⌘N + ⌘V」流程：本地图片随富文本嵌入备忘录
+        if let noteID = NotesService.createNoteByPasting(markdown: md) {
+            hasPushedToNotes = true
+            NotePushCache.store(md, noteID: noteID)
+            bindNote(id: noteID, name: MarkdownRenderer.deriveTitle(from: md) ?? "未命名备忘录", silent: true)
+            return true
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let result = NotesService.createNote(html: html)
             DispatchQueue.main.async {
@@ -898,6 +950,14 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
                 setStatus("更新失败：\(error.localizedDescription)")
                 return false
             }
+        }
+        // 未关联时优先「⌘N + ⌘V」流程嵌入本地图片；失败回退纯 HTML
+        if let id = NotesService.createNoteByPasting(markdown: md) {
+            hasPushedToNotes = true
+            NotePushCache.store(md, noteID: id)
+            let title = MarkdownRenderer.deriveTitle(from: md) ?? "未命名备忘录"
+            bindNote(id: id, name: title, silent: true)
+            return true
         }
         switch NotesService.createNote(html: html) {
         case .success(let id):
@@ -1041,7 +1101,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
                 // 期间用户已换绑其他笔记时丢弃过期结果
                 guard NoteBinding.name == name else { return }
                 self.isProgrammaticChange = true
-                self.editorTextView.string = markdown
+                self.setEditorPlainText(markdown)
                 self.isProgrammaticChange = false
                 self.refreshPreview()
                 // 读回的内容与备忘录一致，视为已同步：关闭时不再提醒更新
@@ -1308,7 +1368,7 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
 
     func setTextForTesting(_ s: String) {
         isProgrammaticChange = true
-        editorTextView.string = s
+        setEditorPlainText(s)
         isProgrammaticChange = false
         refreshPreview()
     }
@@ -1643,6 +1703,45 @@ func runCLI() -> Bool {
         app2.run()
         return true
     }
+    if let idx = args.firstIndex(of: "--create-note-debug"), idx + 1 < args.count {
+        // 测试用：带逐步日志的「⌘N + ⌘V」流程，日志写 /tmp/create-note-debug.log
+        let md = (try? String(contentsOfFile: args[idx + 1], encoding: .utf8)) ?? ""
+        let app2 = NSApplication.shared
+        app2.setActivationPolicy(.accessory)
+        NotesService.runCreateNoteDebug(markdown: md)
+        print("debug done, see /tmp/create-note-debug.log")
+        fflush(stdout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NSApp.terminate(nil) }
+        return true
+    }
+    if args.contains("--ax-status") {
+        // 测试用：打印辅助功能权限状态后退出
+        print("trusted=\(NotesService.canPasteIntoNotes)")
+        fflush(stdout)
+        return true
+    }
+    if let idx = args.firstIndex(of: "--create-note"), idx + 1 < args.count {
+        // 测试用：走「⌘N + ⌘V 粘贴」完整流程创建备忘录（本地图片嵌入），打印新笔记 id
+        let md = (try? String(contentsOfFile: args[idx + 1], encoding: .utf8)) ?? ""
+        let app2 = NSApplication.shared
+        app2.setActivationPolicy(.accessory)
+        let trusted = NotesService.canPasteIntoNotes
+        var result = "trusted=\(trusted)"
+        if trusted {
+            if let nid = NotesService.createNoteByPasting(markdown: md) {
+                result += " id=" + nid
+            } else {
+                let hint = NotesService.lastPasteFailureHint
+                result += " id=FAIL(" + (hint.isEmpty ? "no-new-id" : hint) + ")"
+            }
+        } else {
+            result += " (未授予辅助功能权限，粘贴流程不可用)"
+        }
+        print(result)
+        fflush(stdout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NSApp.terminate(nil) }
+        return true
+    }
     if let idx = args.firstIndex(of: "--screenshot"), idx + 1 < args.count {
         let md = (try? String(contentsOfFile: args[idx + 1], encoding: .utf8)) ?? ""
         // 相对图片路径按该 md 文件所在目录解析（与打开文件后的行为一致；NMD_BASE_DIR 可覆盖）
@@ -1699,6 +1798,18 @@ func runCLI() -> Bool {
                 wc.editorTextView.paste(nil)
             }
         }
+        // 测试：把 HTML 当剪贴板内容粘贴进编辑区（验证编辑区不被富文本属性污染）
+        if let htmlPath = ProcessInfo.processInfo.environment["NMD_PASTE_HTML"],
+           let htmlData = FileManager.default.contents(atPath: htmlPath) {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setData(htmlData, forType: .html)
+            DispatchQueue.main.async {
+                wc.editorTextView.window?.makeFirstResponder(wc.editorTextView)
+                wc.editorTextView.setSelectedRange(NSRange(location: wc.editorTextView.string.count, length: 0))
+                wc.editorTextView.paste(nil)
+            }
+        }
         let waitSec = ProcessInfo.processInfo.environment["NMD_SHOT_WAIT"].flatMap(Double.init) ?? 5
         Timer.scheduledTimer(withTimeInterval: waitSec, repeats: false) { _ in
             guard let content = wc.window?.contentView else {
@@ -1708,6 +1819,17 @@ func runCLI() -> Bool {
             if let scrollY = ProcessInfo.processInfo.environment["NMD_SHOT_SCROLL"].flatMap(Double.init) {
                 wc.previewTextView.scroll(NSPoint(x: 0, y: scrollY))
                 wc.previewTextView.window?.display()
+            }
+            // 测试：打印编辑区文本存储的属性分布（富文本污染时会出现多种字体/底色）
+            if ProcessInfo.processInfo.environment["NMD_EDITOR_ATTRS"] == "1",
+               let storage = wc.editorTextView.textStorage {
+                let full = NSRange(location: 0, length: storage.length)
+                var bgRuns = 0, colorRuns = Set<String>(), fonts = Set<String>(), paraRuns = 0
+                storage.enumerateAttribute(.backgroundColor, in: full) { v, _, _ in if v != nil { bgRuns += 1 } }
+                storage.enumerateAttribute(.foregroundColor, in: full) { v, _, _ in if v != nil { colorRuns.insert("\(v)") } }
+                storage.enumerateAttribute(.font, in: full) { v, _, _ in fonts.insert((v as? NSFont)?.fontName ?? "nil") }
+                storage.enumerateAttribute(.paragraphStyle, in: full) { v, _, _ in if v != nil { paraRuns += 1 } }
+                FileHandle.standardError.write(Data("EDITOR-ATTRS: chars=\(storage.length) bgRuns=\(bgRuns) paraRuns=\(paraRuns) fonts=\(fonts.sorted()) coloredRuns=\(colorRuns.count)\n".utf8))
             }
             content.displayIfNeeded()
             if let rep = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
@@ -2123,6 +2245,34 @@ func runCLI() -> Bool {
         print(MarkdownRenderer.html(from: md))
         return true
     }
+    // 调试用：把渲染结果的属性分段打印出来（字体/颜色/删除线/链接/底色/缩进），
+    // 用于核对某段文字到底被当成了哪种语法
+    if let idx = args.firstIndex(of: "--attrdump"), idx + 1 < args.count,
+       let md = try? String(contentsOfFile: args[idx + 1], encoding: .utf8) {
+        MarkdownRenderer.preloadLocalImages(in: md)
+        let attr = MarkdownRenderer.render(md, contentWidth: 720)
+        func rgbText(_ c: NSColor) -> String {
+            guard let c2 = c.usingColorSpace(.deviceRGB) else { return "other" }
+            return String(format: "#%02X%02X%02X", Int(c2.redComponent * 255),
+                          Int(c2.greenComponent * 255), Int(c2.blueComponent * 255))
+        }
+        attr.enumerateAttributes(in: NSRange(location: 0, length: attr.length), options: []) {
+            a, range, _ in
+            let raw = (attr.string as NSString).substring(with: range)
+            let shown = String(raw.prefix(48)).replacingOccurrences(of: "\n", with: "\\n")
+            let font = (a[.font] as? NSFont)?.fontName ?? "-"
+            let color = (a[.foregroundColor] as? NSColor).map(rgbText) ?? "-"
+            let strike = (a[.strikethroughStyle] as? Int) ?? 0
+            let link = a[.link] != nil ? 1 : 0
+            let para = a[.paragraphStyle] as? NSParagraphStyle
+            let indent = para.map { String(format: "%.0f/%.0f", $0.firstLineHeadIndent, $0.headIndent) } ?? "-"
+            let spacing = para.map { Double(Int($0.paragraphSpacing * 10)) / 10.0 } ?? 0.0
+            let quote = (a[QuoteAttributes.depth] as? Int).map { " quote=\($0)" } ?? ""
+            print("RUN font=\(font) color=\(color) strike=\(strike) link=\(link) "
+                + "indent=\(indent) spacing=\(spacing)\(quote) | \(shown)")
+        }
+        return true
+    }
     if let idx = args.firstIndex(of: "--png"), idx + 1 < args.count {
         let attr: NSAttributedString
         if args[idx + 1] == "-d" {
@@ -2133,6 +2283,7 @@ func runCLI() -> Bool {
             ImageStore.baseDirectory = (inURL.isFileURL && inURL.path.hasPrefix("/"))
                 ? inURL.deletingLastPathComponent()
                 : URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            MarkdownRenderer.preloadLocalImages(in: r)
             attr = MarkdownRenderer.render(r)
         } else {
             FileHandle.standardError.write(Data("读取文件失败\n".utf8)); return true

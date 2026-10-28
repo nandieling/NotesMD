@@ -10,6 +10,30 @@ extension MarkdownRenderer {
         render(markdown, contentWidth: 720, onImageLoaded: nil)
     }
 
+    /// 把 markdown 引用的本地图片同步读进 ImageStore 缓存，
+    /// 使后续 render() 产出的富文本携带真实图片数据（粘贴进备忘录需要）。
+    /// 远程图片仅用已有缓存，不阻塞。
+    static func preloadLocalImages(in markdown: String) {
+        let ns = markdown as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        var seen = Set<String>()
+        let patterns = [
+            #"!\[[^\]]*\]\(([^)\s]+)\)"#,
+            #"<img[^>]+src=[\"']([^\"']+)[\"']"#
+        ]
+        for pattern in patterns {
+            guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
+            for m in re.matches(in: markdown, range: full) where m.numberOfRanges > 1 {
+                let urlText = ns.substring(with: m.range(at: 1))
+                let key = urlText.trimmingCharacters(in: .whitespaces)
+                guard !key.isEmpty, seen.insert(key).inserted else { continue }
+                if let url = ImageStore.url(from: key), url.isFileURL {
+                    ImageStore.shared.loadLocalSync(url)
+                }
+            }
+        }
+    }
+
     /// - contentWidth: 预览区内容宽度（pt），用于约束图床图片展示尺寸
     /// - onImageLoaded: 某张图床图片下载完成后回调（用于重新渲染）
     static func render(_ markdown: String,
@@ -25,6 +49,54 @@ extension MarkdownRenderer {
 
     private static let headingSizes: [CGFloat] = [24, 20, 17, 15, 14, 13]
 
+    /// 行尾反斜杠是硬换行标记，渲染时不显示（行尾两个空格本身不产生可见字符）
+    static func hardBreakMarkStripped(_ line: String) -> String {
+        guard line.hasSuffix("\\"), !line.hasSuffix("\\\\") else { return line }
+        return String(line.dropLast())
+    }
+
+    /// CommonMark 行内代码：N 个反引号开始、配对的 N 个反引号结束，
+    /// 内容首尾各一个空格会被去掉（`` a ` b `` -> a ` b）
+    static func scanCodeSpan(in s: String) -> (loc: Int, end: Int, text: String)? {
+        let ns = s as NSString
+        let units = Array(s.utf16)
+        let backtick: UInt16 = 96
+        var i = 0
+        while i < units.count {
+            guard units[i] == backtick else { i += 1; continue }
+            var openLen = 0
+            while i + openLen < units.count, units[i + openLen] == backtick { openLen += 1 }
+            var j = i + openLen
+            while j < units.count {
+                if units[j] == backtick {
+                    var closeLen = 0
+                    while j + closeLen < units.count, units[j + closeLen] == backtick { closeLen += 1 }
+                    if closeLen == openLen {
+                        var text = ns.substring(with: NSRange(location: i + openLen,
+                                                              length: j - i - openLen))
+                        if text.count >= 2, text.hasPrefix(" "), text.hasSuffix(" "),
+                           !text.allSatisfy({ $0 == " " }) {
+                            text.removeFirst()
+                            text.removeLast()
+                        }
+                        return (i, j + closeLen, text)
+                    }
+                    j += closeLen
+                } else {
+                    j += 1
+                }
+            }
+            i += openLen            // 这一段反引号没有配对，继续往后找
+        }
+        return nil
+    }
+
+    /// 图片是否独占整行（只有独立成行的图片才在图下显示 alt 说明文字）
+    static func isImageOnlyLine(_ line: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        return MarkdownRenderer.match(#"^(?:!\[[^\]]*\]\([^)\s]+\)(?:\s*\{[^}]*\})?|<img[^>]*>)$"#, t) != nil
+    }
+
     static func appendBlocks(_ blocks: [MDBlock], to out: NSMutableAttributedString,
                              indent: CGFloat, quoteDepth: Int,
                              contentWidth: CGFloat, onImageLoaded: (() -> Void)?) {
@@ -35,7 +107,9 @@ extension MarkdownRenderer {
                        before: CGFloat = 0, after: CGFloat = 0, line: CGFloat = 0) -> NSParagraphStyle {
             let p = NSMutableParagraphStyle()
             p.headIndent = head
-            if let first { p.firstLineHeadIndent = first }
+            // 默认首行也按 headIndent 缩进：否则引用块/对齐块内的首行不缩进，
+            // 只有换行后的第二行起才有缩进（引用看起来像普通段落）
+            p.firstLineHeadIndent = first ?? head
             p.paragraphSpacingBefore = before
             p.paragraphSpacing = after
             p.lineSpacing = line
@@ -57,15 +131,21 @@ extension MarkdownRenderer {
                 out.append(NSAttributedString(string: "\n", attributes: base))
 
             case .paragraph(let lines):
-                let p = paraStyle(head: indent, after: 8, line: 4)
-                let base: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: paraSize),
-                    .foregroundColor: textColor,
-                    .paragraphStyle: p
-                ]
-                for line in lines {
-                    out.append(attributedInline(line, base: base,
-                                                contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+                // 每个源行各起一行（与写进备忘录的 <br> 语义一致），
+                // 但段距只加在末行：否则多行段落的行距被拉成段落间距，看着像断成多段
+                for (li, raw) in lines.enumerated() {
+                    let p = paraStyle(head: indent,
+                                      after: li == lines.count - 1 ? 8 : 0,
+                                      line: 4)
+                    let base: [NSAttributedString.Key: Any] = [
+                        .font: NSFont.systemFont(ofSize: paraSize),
+                        .foregroundColor: textColor,
+                        .paragraphStyle: p
+                    ]
+                    out.append(attributedInline(hardBreakMarkStripped(raw), base: base,
+                                                contentWidth: contentWidth,
+                                                imageAlone: isImageOnlyLine(raw),
+                                                onImageLoaded: onImageLoaded))
                     out.append(NSAttributedString(string: "\n", attributes: base))
                 }
 
@@ -91,8 +171,18 @@ extension MarkdownRenderer {
                 }
 
             case .quote(let inner):
-                appendBlocks(inner, to: out, indent: indent + 18, quoteDepth: quoteDepth + 1,
+                // 先渲染引用内部，再整段补引用层级标记（已有的层级更深，保持不变）；
+                // 预览区据此在左侧逐层绘制引用竖线
+                let nested = NSMutableAttributedString()
+                appendBlocks(inner, to: nested, indent: indent + 18, quoteDepth: quoteDepth + 1,
                              contentWidth: max(contentWidth - 18, 60), onImageLoaded: onImageLoaded)
+                let full = NSRange(location: 0, length: nested.length)
+                nested.enumerateAttribute(QuoteAttributes.depth, in: full, options: []) { v, r, _ in
+                    if v == nil {
+                        nested.addAttribute(QuoteAttributes.depth, value: quoteDepth + 1, range: r)
+                    }
+                }
+                out.append(nested)
 
             case .list(let list):
                 renderListInto(list, level: 0, into: out,
@@ -104,12 +194,17 @@ extension MarkdownRenderer {
 
             case .hr:
                 let p = paraStyle(head: indent, before: 6, after: 6)
+                let ruleFont = NSFont.systemFont(ofSize: 12)
                 let base: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: 12),
+                    .font: ruleFont,
                     .foregroundColor: NSColor(white: 0.7, alpha: 1),
                     .paragraphStyle: p
                 ]
-                out.append(NSAttributedString(string: String(repeating: "─", count: 36) + "\n", attributes: base))
+                // 横线按内容宽度铺满（固定 36 个字符在宽窗口下只到半行，窄窗口下会溢出）
+                let dashW = ("─" as NSString).size(withAttributes: [.font: ruleFont]).width
+                let count = max(1, Int((contentWidth - indent) / max(dashW, 1)))
+                out.append(NSAttributedString(string: String(repeating: "─", count: count) + "\n",
+                                              attributes: base))
 
             case .aligned(let align, let inner):
                 renderAlignedBlocks(inner, align: align, into: out, indent: indent,
@@ -130,6 +225,7 @@ extension MarkdownRenderer {
         func alignStyle(head: CGFloat, before: CGFloat = 0, after: CGFloat = 0, line: CGFloat = 0) -> NSParagraphStyle {
             let p = NSMutableParagraphStyle()
             p.headIndent = head
+            p.firstLineHeadIndent = head
             p.paragraphSpacingBefore = before
             p.paragraphSpacing = after
             p.lineSpacing = line
@@ -157,10 +253,15 @@ extension MarkdownRenderer {
                     .paragraphStyle: alignStyle(head: indent, after: 8, line: 4)
                 ]
                 let text = lines.isEmpty ? [""] : lines
-                for line in text {
-                    out.append(attributedInline(line, base: base,
-                                                contentWidth: contentWidth, onImageLoaded: onImageLoaded))
-                    out.append(NSAttributedString(string: "\n", attributes: base))
+                for (li, line) in text.enumerated() {
+                    var perLine = base
+                    perLine[.paragraphStyle] = alignStyle(head: indent,
+                                                          after: li == text.count - 1 ? 8 : 0, line: 4)
+                    out.append(attributedInline(hardBreakMarkStripped(line), base: perLine,
+                                                contentWidth: contentWidth,
+                                                imageAlone: isImageOnlyLine(line),
+                                                onImageLoaded: onImageLoaded))
+                    out.append(NSAttributedString(string: "\n", attributes: perLine))
                 }
 
             default:
@@ -190,7 +291,7 @@ extension MarkdownRenderer {
             } else if list.ordered {
                 head += 24
                 firstLine = indent + CGFloat(level) * 18 + 4
-                bullet = "\(number).  "
+                bullet = "\(number)" + (list.parenthesized ? ")  " : ".  ")
             } else {
                 head += 20
                 firstLine = indent + CGFloat(level) * 18
@@ -207,15 +308,36 @@ extension MarkdownRenderer {
                 .paragraphStyle: p
             ]
             out.append(NSAttributedString(string: bullet, attributes: base))
-            let textLines = item.text.isEmpty ? [""] : item.text
-            for (li, line) in textLines.enumerated() {
-                out.append(attributedInline(line, base: base,
-                                            contentWidth: contentWidth, onImageLoaded: onImageLoaded))
-                if li < textLines.count - 1 {
-                    out.append(NSAttributedString(string: "\n", attributes: base))
+            // 正文行与条目内嵌的围栏代码块按原文顺序输出（正文行为同段软换行，
+            // 代码块按条目正文缩进整块填充底色）
+            let parts: [MDList.Item.Part] = item.parts.isEmpty ? [.text("")] : item.parts
+            // 代码块之后的正文是新段落，首行也要缩进到条目正文位置（否则回到项目符号处）
+            let contStyle: NSParagraphStyle = {
+                let p2 = NSMutableParagraphStyle()
+                p2.headIndent = p.headIndent
+                p2.firstLineHeadIndent = p.headIndent
+                p2.paragraphSpacing = p.paragraphSpacing
+                p2.lineSpacing = p.lineSpacing
+                return p2
+            }()
+            var firstTextPart = true
+            for part in parts {
+                switch part {
+                case .text(let line):
+                    var lineBase = base
+                    if !firstTextPart { lineBase[.paragraphStyle] = contStyle }
+                    firstTextPart = false
+                    out.append(attributedInline(line, base: lineBase,
+                                                contentWidth: contentWidth,
+                                                imageAlone: isImageOnlyLine(line),
+                                                onImageLoaded: onImageLoaded))
+                    out.append(NSAttributedString(string: "\n", attributes: lineBase))
+                case .code(let lang, let lines):
+                    appendBlocks([.code(lang: lang, lines: lines)], to: out, indent: head,
+                                 quoteDepth: quoteDepth, contentWidth: contentWidth,
+                                 onImageLoaded: onImageLoaded)
                 }
             }
-            out.append(NSAttributedString(string: "\n", attributes: base))
             for sub in item.children {
                 renderListInto(sub, level: level + 1, into: out,
                                indent: indent, quoteDepth: quoteDepth,
@@ -444,6 +566,7 @@ extension MarkdownRenderer {
     /// 内联语法 -> 富文本：行内代码 > 图片 > 加粗 > 斜体 > 删除线 > 链接 > 内联 HTML 标签
     static func attributedInline(_ raw: String, base: [NSAttributedString.Key: Any],
                                  contentWidth: CGFloat = 720,
+                                 imageAlone: Bool = false,
                                  onImageLoaded: (() -> Void)? = nil) -> NSAttributedString {
         let result = NSMutableAttributedString()
         var rest = raw
@@ -469,13 +592,23 @@ extension MarkdownRenderer {
                 }
             }
             consider(#"(\\)([\\`*_{}\[\]()#+.!>~-])"#, kind: 0)
-            consider(#"`([^`]+)`"#, kind: 1)
             consider(#"!\[([^\]]*)\]\(([^)\s]+)\)(\{[^}]*\})?"#, kind: 2)
-            consider(#"(\*\*|__)(.+?)\1"#, kind: 3)
-            consider(#"(\*|_)([^*_]+?)\1"#, kind: 4)
-            consider(#"~~(.+?)~~"#, kind: 5)
-            consider(#"<((?:https?|ftp)://[^<>\s]+)>"#, kind: 6)
-            consider(#"\[([^\]]+)\]\(([^)\s]+)\)"#, kind: 7)
+            // 粗斜体优先于加粗：否则 ***x*** 会被切成 **x* 并残留一个星号
+            consider(#"(\*\*\*|___)([^*_]+?)\1"#, kind: 3)
+            consider(#"(\*\*|__)(.+?)\1"#, kind: 4)
+            consider(#"\*([^*\n]+?)\*"#, kind: 5)
+            // 下划线斜体：词内下划线（snake_case_name）不作强调
+            consider(#"(?<![A-Za-z0-9_])_([^_\n]+?)_(?![A-Za-z0-9])"#, kind: 5)
+            consider(#"~~(.+?)~~"#, kind: 6)
+            consider(#"<((?:https?|ftp)://[^<>\s]+)>"#, kind: 7)
+            // 链接允许可选标题：[文本](url "标题")
+            consider(#"\[((?:[^\[\]]|\[[^\]]*\])+)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)"#, kind: 8)
+
+            // 行内代码单独扫描（正则处理不了变长反引号定界），按位置参与排序
+            if let cs = scanCodeSpan(in: rest),
+               best == nil || cs.loc < best!.loc || (cs.loc == best!.loc && best!.kind > 1) {
+                best = (cs.loc, cs.end, 1, [cs.text])
+            }
 
             let tag = HtmlScanner.firstTag(in: rest)
 
@@ -502,6 +635,7 @@ extension MarkdownRenderer {
                best == nil || tag.range.location < best!.loc {
                 let (out, next) = renderHTMLTag(tag, rest: rest, base: base,
                                                 contentWidth: contentWidth,
+                                                imageAlone: imageAlone,
                                                 onImageLoaded: onImageLoaded)
                 result.append(out)
                 rest = next
@@ -510,14 +644,16 @@ extension MarkdownRenderer {
 
             guard let b = best else {
                 if !rest.isEmpty {
-                    result.append(NSAttributedString(string: rest, attributes: base))
+                    result.append(NSAttributedString(string: HtmlStyle.unescapeEntities(rest),
+                                                     attributes: base))
                 }
                 break
             }
 
             let prefix = (rest as NSString).substring(to: b.loc)
             if !prefix.isEmpty {
-                result.append(NSAttributedString(string: prefix, attributes: base))
+                result.append(NSAttributedString(string: HtmlStyle.unescapeEntities(prefix),
+                                                 attributes: base))
             }
 
             var attrs = base
@@ -534,42 +670,57 @@ extension MarkdownRenderer {
             case 2:
                 // 图床图片：以文本附件插入；未命中缓存时先放占位图，下载完成后整体重渲染
                 // 支持尾部属性 {align=center width=70%}
-                let alt = b.groups[0]
+                let alt = HtmlStyle.unescapeEntities(b.groups[0])
                 let imageAttrs: ImageAttributes? = b.groups.count >= 3 && !b.groups[2].isEmpty
                     ? ImageAttrParser.parse(String(b.groups[2].dropFirst().dropLast()))
                     : nil
                 if let imgAttr = makeImage(urlText: b.groups[1], alt: alt, attrs: attrs,
-                                           imageAttrs: imageAttrs,
+                                           imageAttrs: imageAttrs, allowCaption: imageAlone,
                                            contentWidth: contentWidth, onImageLoaded: onImageLoaded) {
                     result.append(imgAttr)
                 } else {
                     result.append(NSAttributedString(string: "![](" + b.groups[1] + ")", attributes: attrs))
                 }
             case 3:
+                // 粗斜体 ***x*** / ___x___：分组 1 是分隔符，分组 2 才是内容
+                if let f = attrs[.font] as? NSFont {
+                    let bold = NSFontManager.shared.convert(f, toHaveTrait: .boldFontMask)
+                    attrs[.font] = NSFontManager.shared.convert(bold, toHaveTrait: .italicFontMask)
+                }
+                result.append(attributedInline(b.groups[1], base: attrs,
+                                               contentWidth: contentWidth, imageAlone: imageAlone,
+                                               onImageLoaded: onImageLoaded))
+            case 4:
                 if let f = attrs[.font] as? NSFont {
                     attrs[.font] = NSFont.boldSystemFont(ofSize: f.pointSize)
                 }
                 result.append(attributedInline(b.groups[1], base: attrs,
-                                               contentWidth: contentWidth, onImageLoaded: onImageLoaded))
-            case 4:
+                                               contentWidth: contentWidth, imageAlone: imageAlone,
+                                               onImageLoaded: onImageLoaded))
+            case 5:
                 if let f = attrs[.font] as? NSFont {
                     attrs[.font] = NSFontManager.shared.convert(f, toHaveTrait: .italicFontMask)
                 }
-                result.append(attributedInline(b.groups[1], base: attrs,
-                                               contentWidth: contentWidth, onImageLoaded: onImageLoaded))
-            case 5:
+                result.append(attributedInline(b.groups[0], base: attrs,
+                                               contentWidth: contentWidth, imageAlone: imageAlone,
+                                               onImageLoaded: onImageLoaded))
+            case 6:
                 attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
                 result.append(attributedInline(b.groups[0], base: attrs,
-                                               contentWidth: contentWidth, onImageLoaded: onImageLoaded))
-            case 6:
+                                               contentWidth: contentWidth, imageAlone: imageAlone,
+                                               onImageLoaded: onImageLoaded))
+            case 7:
                 // 自动链接 <url>
                 attrs[.foregroundColor] = NSColor.linkColor
                 attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
                 result.append(NSAttributedString(string: b.groups[0], attributes: attrs))
             default:
+                // 链接：链接文字继续按行内语法渲染（[**加粗**](url) 等）
                 attrs[.foregroundColor] = NSColor.linkColor
                 attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                result.append(NSAttributedString(string: b.groups[0], attributes: attrs))
+                result.append(attributedInline(b.groups[0], base: attrs,
+                                               contentWidth: contentWidth, imageAlone: imageAlone,
+                                               onImageLoaded: onImageLoaded))
             }
             rest = (rest as NSString).substring(from: b.end)
         }
@@ -580,6 +731,7 @@ extension MarkdownRenderer {
     private static func renderHTMLTag(_ tag: HtmlTag, rest: String,
                                       base: [NSAttributedString.Key: Any],
                                       contentWidth: CGFloat,
+                                      imageAlone: Bool = false,
                                       onImageLoaded: (() -> Void)?) -> (NSAttributedString, String) {
         let ns = rest as NSString
         let tagEnd = tag.range.location + tag.range.length
@@ -627,6 +779,7 @@ extension MarkdownRenderer {
             if let imgAttr = makeImage(urlText: src, alt: tag.attr("alt") ?? "",
                                        attrs: base,
                                        imageAttrs: ia.isEmpty ? nil : ia,
+                                       allowCaption: imageAlone,
                                        contentWidth: contentWidth,
                                        onImageLoaded: onImageLoaded) {
                 out.append(imgAttr)
@@ -639,7 +792,7 @@ extension MarkdownRenderer {
                 la[.underlineStyle] = NSUnderlineStyle.single.rawValue
                 let inner = ns.substring(with: NSRange(location: tagEnd, length: close.start - tagEnd))
                 out.append(attributedInline(inner, base: la, contentWidth: contentWidth,
-                                            onImageLoaded: onImageLoaded))
+                                            imageAlone: imageAlone, onImageLoaded: onImageLoaded))
                 return (out, ns.substring(from: close.end))
             }
             return lit()
@@ -734,13 +887,14 @@ extension MarkdownRenderer {
         if let close = closeRange() {
             let inner = ns.substring(with: NSRange(location: tagEnd, length: close.start - tagEnd))
             out.append(attributedInline(inner, base: effective, contentWidth: contentWidth,
-                                        onImageLoaded: onImageLoaded))
+                                        imageAlone: imageAlone, onImageLoaded: onImageLoaded))
             return (out, ns.substring(from: close.end))
         }
         if styled != nil {
             // 没有闭合标签：样式应用到剩余文字
             out.append(attributedInline(ns.substring(from: tagEnd), base: effective,
-                                        contentWidth: contentWidth, onImageLoaded: onImageLoaded))
+                                        contentWidth: contentWidth,
+                                        imageAlone: imageAlone, onImageLoaded: onImageLoaded))
             return (out, "")
         }
         return lit()
@@ -751,6 +905,7 @@ extension MarkdownRenderer {
     private static func makeImage(urlText: String, alt: String,
                                   attrs: [NSAttributedString.Key: Any],
                                   imageAttrs: ImageAttributes? = nil,
+                                  allowCaption: Bool = true,
                                   contentWidth: CGFloat,
                                   onImageLoaded: (() -> Void)?) -> NSAttributedString? {
         guard let url = ImageStore.url(from: urlText) else { return nil }
@@ -790,7 +945,7 @@ extension MarkdownRenderer {
         if let ps = alignStyle {
             out.addAttribute(.paragraphStyle, value: ps, range: NSRange(location: 0, length: 1))
         }
-        if !alt.isEmpty {
+        if allowCaption, !alt.isEmpty {
             var caption = attrs
             if let f = caption[.font] as? NSFont {
                 caption[.font] = NSFont.systemFont(ofSize: max(f.pointSize - 3, 10))

@@ -13,12 +13,19 @@ struct MDTable {
 /// 列表：有序/无序、起始编号、条目（支持任务项与嵌套子列表）
 struct MDList {
     struct Item {
-        var text: [String] = []
+        /// 条目正文行 / 条目内嵌的围栏代码块，按原文顺序排列（渲染顺序由此决定）
+        enum Part {
+            case text(String)
+            case code(lang: String?, lines: [String])
+        }
+        var parts: [Part] = []
         var task: Int? = nil      // 0 未勾选、1 已勾选
         var children: [MDList] = []
     }
     var ordered: Bool
     var start: Int
+    /// 有序列表用 `1)` 右括号标记（预览区据此显示 `1)` 而不是 `1.`）
+    var parenthesized = false
     var items: [Item] = []
 }
 
@@ -38,7 +45,87 @@ enum MDBlock {
 enum MDParser {
 
     static func blocks(from markdown: String) -> [MDBlock] {
-        parseLines(markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n"))
+        let lines = markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        return parseLines(resolveReferenceLinks(lines))
+    }
+
+    // MARK: - 引用式链接
+
+    /// 参考定义行：`[标签]: URL "可选标题"`（行首最多三个空格，CommonMark）
+    private static let refDefPattern =
+        #"^\s{0,3}\[([^\]]+)\]:\s*(\S+)(?:\s+["'(][^"'()]*[)"'])?\s*$"#
+
+    /// 收集并删掉参考定义行，同时把 [文本][标签]、[标签][]、[标签] 就地改写成内联链接。
+    /// 定义可以写在文档任意位置；围栏代码块内的行原样保留。
+    private static func resolveReferenceLinks(_ lines: [String]) -> [String] {
+        var defs: [String: String] = [:]
+        var isDef = [Bool](repeating: false, count: lines.count)
+        var inFence = [Bool](repeating: false, count: lines.count)
+        var fence: Character?
+        for (idx, line) in lines.enumerated() {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if let fc = fence {
+                inFence[idx] = true
+                if !t.isEmpty, t.allSatisfy({ $0 == fc }) { fence = nil }
+                continue
+            }
+            if t.hasPrefix("```") || t.hasPrefix("~~~") {
+                inFence[idx] = true
+                fence = t[t.startIndex]
+                continue
+            }
+            guard let m = MarkdownRenderer.match(refDefPattern, line) else { continue }
+            let label = normalizeRefLabel(m[0])
+            if !label.isEmpty, defs[label] == nil { defs[label] = m[1] }
+            isDef[idx] = true
+        }
+        guard !defs.isEmpty else { return lines }
+        var out: [String] = []
+        for (idx, line) in lines.enumerated() {
+            if isDef[idx] {
+                out.append("")                        // 定义行本身不显示
+            } else {
+                out.append(inFence[idx] ? line : expandRefs(line, defs: defs))
+            }
+        }
+        return out
+    }
+
+    /// 标签匹配忽略大小写与首尾、中间多余空白
+    private static func normalizeRefLabel(_ s: String) -> String {
+        s.lowercased()
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// 展开一行内的引用式链接：完整式 [文本][标签]、折叠式 [标签][]、简写式 [标签]
+    private static func expandRefs(_ line: String, defs: [String: String]) -> String {
+        guard line.contains("]"),
+              let re = try? NSRegularExpression(pattern: #"\[([^\[\]]+)\](\[([^\]]*)\])?"#)
+        else { return line }
+        let ns = line as NSString
+        var out = ""
+        var last = 0
+        for m in re.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
+            if m.range.location < last { continue }
+            out += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+            last = m.range.upperBound
+            let text = ns.substring(with: m.range(at: 1))
+            let hasSecond = m.range(at: 2).location != NSNotFound
+            let second = hasSecond
+                ? ns.substring(with: m.range(at: 3)).trimmingCharacters(in: .whitespaces) : ""
+            let label = hasSecond ? (second.isEmpty ? text : second) : text
+            // 紧跟 ( 的是内联链接 [文本](url)，不是引用式
+            let next = last < ns.length ? ns.substring(with: NSRange(location: last, length: 1)) : ""
+            if next != "(", let url = defs[normalizeRefLabel(label)] {
+                out += "[\(text)](\(url))"
+            } else {
+                out += ns.substring(with: m.range)
+            }
+        }
+        out += ns.substring(from: last)
+        return out
     }
 
     static func parseLines(_ lines: [String]) -> [MDBlock] {
@@ -77,25 +164,9 @@ enum MDParser {
             }
 
             // 围栏代码块（``` 或 ~~~，可带语言名）
-            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
-                let fenceChar = trimmed[trimmed.startIndex]
-                var fenceLen = 0
-                for ch in trimmed {
-                    if ch == fenceChar { fenceLen += 1 } else { break }
-                }
-                let lang = String(trimmed.dropFirst(fenceLen)).trimmingCharacters(in: .whitespaces)
-                var code: [String] = []
-                i += 1
-                while i < lines.count {
-                    let t = lines[i].trimmingCharacters(in: .whitespaces)
-                    // 结束围栏：仅由同一字符组成且长度不小于开始围栏（CommonMark 语义）。
-                    // 代码内部"以 ``` 开头"的行（如内嵌示例、带语言名的行）不会提前结束块
-                    if !t.isEmpty, t.allSatisfy({ $0 == fenceChar }), t.count >= fenceLen { break }
-                    code.append(lines[i])
-                    i += 1
-                }
-                if i < lines.count { i += 1 }
-                out.append(.code(lang: lang.isEmpty ? nil : lang, lines: code))
+            if let (block, next) = parseFence(lines, from: i, stripIndent: 0) {
+                out.append(block)
+                i = next
                 continue
             }
 
@@ -160,13 +231,21 @@ enum MDParser {
                 continue
             }
 
+            // 水平线：先于列表判定（`- - -`、`*  *  *` 既像列表项又是分隔线，CommonMark 取分隔线）
+            if MarkdownRenderer.isHorizontalRule(trimmed) {
+                out.append(.hr)
+                i += 1
+                continue
+            }
+
             // 列表（含嵌套、任务项）
             if isUnorderedItem(line) || isOrderedItem(line) {
                 let (list, next) = parseListLevel(
                     lines, i: i,
                     ordered: isOrderedItem(line),
                     start: orderedNumber(line),
-                    baseIndent: indentOf(line))
+                    baseIndent: indentOf(line),
+                    parenthesized: orderedParen(line))
                 out.append(.list(list))
                 i = next
                 continue
@@ -187,15 +266,30 @@ enum MDParser {
                 continue
             }
 
-            // 水平线（独立成块时）
-            if MarkdownRenderer.isHorizontalRule(trimmed) {
-                out.append(.hr)
-                i += 1
+            // 缩进代码块：行首 4 空格或 Tab（CommonMark）；
+            // 段落延续行、列表项内部缩进已在上面的分支处理，不会走到这里
+            if indentOf(line) >= 4 {
+                var code: [String] = []
+                var blanks: [String] = []
+                while i < lines.count {
+                    let l = lines[i]
+                    if l.trimmingCharacters(in: .whitespaces).isEmpty {
+                        blanks.append("")
+                        i += 1
+                        continue
+                    }
+                    guard indentOf(l) >= 4 else { break }
+                    code.append(contentsOf: blanks)     // 块内空行保留
+                    blanks.removeAll(keepingCapacity: true)
+                    code.append(dropIndent(l, 4))
+                    i += 1
+                }
+                out.append(.code(lang: nil, lines: code))
                 continue
             }
 
             // 段落：连续普通行；行内出现 setext 下划线则升级为标题
-            var para: [String] = [line]
+            var para: [String] = [stripLeading(line)]
             i += 1
             var consumed = false
             while i < lines.count {
@@ -220,7 +314,7 @@ enum MDParser {
                 if t.contains("|"), i + 1 < lines.count, isTableDelimiter(lines[i + 1]) {
                     break
                 }
-                para.append(lines[i])
+                para.append(stripLeading(lines[i]))      // 延续行行首空白不显示
                 i += 1
             }
             if !consumed {
@@ -234,30 +328,52 @@ enum MDParser {
 
     private static func parseListLevel(_ lines: [String], i: Int,
                                        ordered: Bool, start: Int,
-                                       baseIndent: Int) -> (MDList, Int) {
-        var list = MDList(ordered: ordered, start: start)
+                                       baseIndent: Int,
+                                       parenthesized: Bool = false) -> (MDList, Int) {
+        var list = MDList(ordered: ordered, start: start, parenthesized: parenthesized)
         var i = i
         while i < lines.count {
             let line = lines[i]
             let t = line.trimmingCharacters(in: .whitespaces)
-            if t.isEmpty { break }
+            if t.isEmpty {
+                // 空行：松散列表里条目可以有多个段落，只要后面的行仍属于本列表
+                // （缩进到条目正文位置，或同缩进的同类条目），否则列表结束
+                var j = i + 1
+                while j < lines.count, lines[j].trimmingCharacters(in: .whitespaces).isEmpty { j += 1 }
+                guard j < lines.count else { break }
+                let nextLine = lines[j]
+                let nextIsItem = isUnorderedItem(nextLine) || isOrderedItem(nextLine)
+                guard indentOf(nextLine) >= baseIndent + 2
+                    || (nextIsItem && indentOf(nextLine) == baseIndent) else { break }
+                if !nextIsItem, !list.items.isEmpty {
+                    list.items[list.items.count - 1].parts.append(.text(""))   // 条目内另起一段
+                }
+                i = j
+                continue
+            }
             let indent = indentOf(line)
             if indent < baseIndent { break }
 
             if indent > baseIndent {
-                // 更深缩进：子列表或条目续行
+                // 更深缩进：子列表、条目内的围栏代码块，或条目续行
                 if isUnorderedItem(line) || isOrderedItem(line) {
                     let (sub, next) = parseListLevel(
                         lines, i: i,
                         ordered: isOrderedItem(line),
                         start: orderedNumber(line),
-                        baseIndent: indent)
+                        baseIndent: indent,
+                        parenthesized: orderedParen(line))
                     if list.items.isEmpty { list.items.append(MDList.Item()) }
                     list.items[list.items.count - 1].children.append(sub)
                     i = next
+                } else if let (block, next) = parseFence(lines, from: i, stripIndent: indent),
+                          case let .code(lang, codeLines) = block {
+                    if list.items.isEmpty { list.items.append(MDList.Item()) }
+                    list.items[list.items.count - 1].parts.append(.code(lang: lang, lines: codeLines))
+                    i = next
                 } else {
                     if !list.items.isEmpty {
-                        list.items[list.items.count - 1].text.append(t)
+                        list.items[list.items.count - 1].parts.append(.text(t))
                     }
                     i += 1
                 }
@@ -273,7 +389,7 @@ enum MDParser {
                 item.task = (m[0] == " ") ? 0 : 1
                 content = m[1]
             }
-            item.text = [content]
+            item.parts = [.text(content)]
             list.items.append(item)
             i += 1
         }
@@ -688,6 +804,51 @@ enum MDParser {
         return Int(m[0]) ?? 1
     }
 
+    /// 有序列表是否用 `1)` 右括号标记
+    static func orderedParen(_ line: String) -> Bool {
+        MarkdownRenderer.match(#"^\s*\d+[)]\s+"#, line) != nil
+    }
+
+    /// 去掉行首最多 width 列缩进（Tab 记 4 列）
+    static func dropIndent(_ line: String, _ width: Int) -> String {
+        var used = 0
+        var idx = line.startIndex
+        while idx < line.endIndex, used < width {
+            let ch = line[idx]
+            if ch == " " { used += 1 }
+            else if ch == "\t" { used += 4 }
+            else { break }
+            idx = line.index(after: idx)
+        }
+        return String(line[idx...])
+    }
+
+    /// 从 from 行起读取围栏代码块（``` 或 ~~~，可带语言名）。
+    /// stripIndent：块内每行最多去掉的缩进列数（列表项内的围栏要和条目内容对齐）。
+    /// 返回代码块与围栏之后的下一行下标；围栏未闭合时读到文件末尾。
+    static func parseFence(_ lines: [String], from: Int, stripIndent: Int) -> (MDBlock, Int)? {
+        let trimmed = lines[from].trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") else { return nil }
+        let fenceChar = trimmed[trimmed.startIndex]
+        var fenceLen = 0
+        for ch in trimmed {
+            if ch == fenceChar { fenceLen += 1 } else { break }
+        }
+        let lang = String(trimmed.dropFirst(fenceLen)).trimmingCharacters(in: .whitespaces)
+        var code: [String] = []
+        var i = from + 1
+        while i < lines.count {
+            let t = lines[i].trimmingCharacters(in: .whitespaces)
+            // 结束围栏：仅由同一字符组成且长度不小于开始围栏（CommonMark 语义）。
+            // 代码内部“以 ``` 开头”的行（如内嵌示例、带语言名的行）不会提前结束块
+            if !t.isEmpty, t.allSatisfy({ $0 == fenceChar }), t.count >= fenceLen { break }
+            code.append(stripIndent == 0 ? lines[i] : dropIndent(lines[i], stripIndent))
+            i += 1
+        }
+        if i < lines.count { i += 1 }
+        return (.code(lang: lang.isEmpty ? nil : lang, lines: code), i)
+    }
+
     static func indentOf(_ line: String) -> Int {
         var n = 0
         for ch in line {
@@ -696,6 +857,11 @@ enum MDParser {
             else { break }
         }
         return n
+    }
+
+    /// 去掉行首空白（段落首行与延续行的缩进按 CommonMark 不显示）
+    static func stripLeading(_ line: String) -> String {
+        String(line.drop(while: { $0 == " " || $0 == "\t" }))
     }
 
     /// setext 下划线：整行 = 或 -

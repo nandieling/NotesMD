@@ -10,6 +10,11 @@ enum CodeBlockAttributes {
     static let background = NSAttributedString.Key("notesmd.codeBlock.background")
 }
 
+/// 引用块层级属性（值 Int，1 = 单层引用）。预览区按它画左侧竖线。
+enum QuoteAttributes {
+    static let depth = NSAttributedString.Key("notesmd.quote.depth")
+}
+
 final class CodeBlockLayoutManager: NSLayoutManager {
 
     /// 原生实现会一次性拿到整段可见 glyph 区间（而不是按背景属性 run 拆分），
@@ -40,19 +45,34 @@ final class CodeBlockLayoutManager: NSLayoutManager {
             if let color = value as? NSColor { blocks.append((range, color)) }
         }
 
+        // 引用块区间（相邻同层区间合并，段距处竖线才不会被切断）
+        var quoteRuns: [(range: NSRange, depth: Int)] = []
+        storage.enumerateAttribute(QuoteAttributes.depth, in: charRange, options: []) { value, range, _ in
+            guard let depth = value as? Int, depth > 0 else { return }
+            if let last = quoteRuns.last, last.depth == depth, last.range.upperBound == range.location {
+                quoteRuns[quoteRuns.count - 1].range =
+                    NSRange(location: last.range.location, length: range.upperBound - last.range.location)
+            } else {
+                quoteRuns.append((range, depth))
+            }
+        }
+
         // 其余背景（如有）仍交给原生填充
         super.drawBackground(forGlyphRange: glyphs, at: point)
-        guard !blocks.isEmpty else { return }
+        guard !blocks.isEmpty || !quoteRuns.isEmpty else { return }
         let base = boundingRect(forGlyphRange: glyphs, in: container)
         dbg("call glyphs=\(glyphs) charRange=\(charRange) point=\(point) base=\(base) blocks=\(blocks.count)")
         if ProcessInfo.processInfo.environment["NMD_LM_DEBUG"] == "1" {
             NSColor.red.setFill()
             NSRect(x: 0, y: 0, width: 2000, height: 2000).fill()
         }
-        // point = glyphRange 整体 bounding rect 左上角（视图坐标）；
-        // 容器坐标统一换算：view = point + (container - baseBounding.origin)
-        func vx(_ x: CGFloat) -> CGFloat { point.x + (x - base.minX) }
-        func vy(_ y: CGFloat) -> CGFloat { point.y + (y - base.minY) }
+        // point = 文本系统给出的文本容器原点（绘图坐标），与滚动位置无关；
+        // 容器坐标 -> 绘图坐标只需加这一个固定偏移。
+        // 不能拿本次区间的包围盒原点做基准：代码块比窗口高、块顶滚出可视区时，
+        // 本次区间的起点就是可视区中部，减掉它会把整块底色往上平移同样多的距离，
+        // 结果是长代码块滚到中间时底色完全看不见（或盖到块外上面的内容上）。
+        func vx(_ x: CGFloat) -> CGFloat { point.x + x }
+        func vy(_ y: CGFloat) -> CGFloat { point.y + y }
 
         let allRange = NSRange(location: 0, length: storage.length)
         for block in blocks {
@@ -105,6 +125,34 @@ final class CodeBlockLayoutManager: NSLayoutManager {
                     NSRect(x: 0, y: 300, width: 2000, height: 100).fill()
                 }
                 fillRect.fill()
+            }
+        }
+
+        // 引用块左侧竖线：每层一条，贴该行片段左缘，向下延伸到下一片段顶缘
+        NSColor.separatorColor.setFill()
+        for run in quoteRuns {
+            let subRun = glyphRange(forCharacterRange: run.range, actualCharacterRange: nil)
+            guard subRun.location != NSNotFound else { continue }
+            var glyphIndex = subRun.location
+            while glyphIndex < NSMaxRange(subRun) {
+                var fragGlyphRange = NSRange()
+                let rect = lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: &fragGlyphRange)
+                glyphIndex = NSMaxRange(fragGlyphRange)
+                let bottomY: CGFloat
+                if glyphIndex < NSMaxRange(subRun) {
+                    var nextRange = NSRange()
+                    bottomY = vy(lineFragmentRect(forGlyphAt: glyphIndex,
+                                                  effectiveRange: &nextRange).minY)
+                } else {
+                    bottomY = vy(rect.maxY)
+                }
+                let topY = vy(rect.minY)
+                guard bottomY > topY else { continue }
+                for level in 1...run.depth {
+                    // 引用每层固定缩进 18pt：竖线画在该层文字左缘前 8pt
+                    NSRect(x: vx(rect.minX + CGFloat(level) * 18 - 11), y: topY,
+                           width: 3, height: bottomY - topY).fill()
+                }
             }
         }
     }
