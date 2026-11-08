@@ -59,26 +59,38 @@ enum NotesService {
         }
     }
 
-    /// 读取指定笔记的正文 HTML（用于「选择备忘录」后把内容转成 Markdown 装入编辑区）
-    static func noteHTML(id: String) -> Result<String, Error> {
+    /// 读取指定笔记的正文 HTML（用于「选择备忘录」后把内容转成 Markdown 装入编辑区）。
+    /// 先按 id 直接引用（服务端过滤，笔记多时也快），失败再按账号/文件夹遍历兜底；
+    /// 大正文（表格笔记可达数百 KB）需要更长的响应时间，超时按失败返回，
+    /// 由调用方提示原因，避免把编辑区清空后还报「已打开」。
+    static func noteHTML(id: String, timeout: TimeInterval = 30) -> Result<String, Error> {
         let script = """
         on run argv
             set theID to item 1 of argv
             tell application "Notes"
-                repeat with n in (notes)
-                    if id of n is theID then
-                        return body of n
-                    end if
+                try
+                    set theBody to body of (first note whose id is theID)
+                    if theBody is missing value then return ""
+                    return theBody
+                end try
+                repeat with acc in accounts
+                    repeat with fld in (folders of acc)
+                        try
+                            set theBody to body of (first note of fld whose id is theID)
+                            if theBody is missing value then return ""
+                            return theBody
+                        end try
+                    end repeat
                 end repeat
             end tell
             return ""
         end run
         """
-        switch runAppleScript(script, args: [id]) {
+        switch runAppleScript(script, args: [id], timeout: timeout) {
         case .success(let out):
             if out.isEmpty {
                 return .failure(NSError(domain: "NotesMD", code: 5,
-                                        userInfo: [NSLocalizedDescriptionKey: "读不到该备忘录的正文"]))
+                                        userInfo: [NSLocalizedDescriptionKey: "读不到该备忘录的正文（可能已被删除或在「最近删除」中）"]))
             }
             return .success(out)
         case .failure(let e):
@@ -160,15 +172,102 @@ enum NotesService {
     //   3. 富文本写入剪贴板 → 编辑→粘贴（本地图片以附件形式嵌入）
     //   4. 读回正文校验；失败则清理空笔记并返回 nil（调用方回退纯 HTML）
 
-    /// 是否有辅助功能权限（菜单查询与点击走 AX 通道）
+    /// 是否有辅助功能权限（菜单点击与焦点读取由本进程直接走 AX 通道）
     static var canPasteIntoNotes: Bool { AXIsProcessTrusted() }
+
+    /// 同一进程内只引导一次系统授权弹窗。授权没生效时（例如重新编译/签名导致
+    /// TCC 记录与当前二进制不匹配），每次操作都弹窗只会反复打断用户；
+    /// 未授权时创建流程会回退为纯 HTML 创建，并在状态栏说明原因。
+    private static var didPromptForAXAccess = false
 
     /// 请求辅助功能权限：未授权时弹出系统对话框（带「打开系统设置」按钮，
     /// 直接定位到 隐私与安全性→辅助功能 列表）。返回当前是否已授权。
     @discardableResult
     static func requestAXAccessIfNeeded() -> Bool {
+        if canPasteIntoNotes { return true }
+        guard !didPromptForAXAccess else { return false }
+        didPromptForAXAccess = true
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         return AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+    }
+
+    // MARK: - 备忘录 UI 操作：本进程直接调用辅助功能 API
+    //
+    // 早先菜单点击/焦点读取是发 AppleScript 给 System Events 做的（UI 脚本）。
+    // 那条路径需要 macOS 26+ 的「设备控制和数据访问」授权，而该授权按「发起控制的
+    // 进程」归属：请求实际由 osascript/System Events 发出，授权记录难以稳定锚定到
+    // NotesMD，于是每次「新建备忘录并粘贴」都重新弹窗，且勾选后仍不生效。
+    // 现在改为在 NotesMD 进程内用 AXUIElement API 直接读备忘录的菜单树并执行
+    // AXPress：不经过 System Events，不合成任何 HID 按键/鼠标事件，
+    // 只需要「辅助功能」这一项按应用身份持久化的授权。
+
+    /// 备忘录进程的 AX 元素（未运行时 nil）
+    private static func notesAXApp() -> AXUIElement? {
+        guard let app = NSWorkspace.shared.runningApplications
+            .first(where: { $0.bundleIdentifier == notesBundleID }) else { return nil }
+        return AXUIElementCreateApplication(app.processIdentifier)
+    }
+
+    private static func axRaw(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
+    }
+
+    private static func axString(_ element: AXUIElement, _ name: String) -> String? {
+        axRaw(element, name) as? String
+    }
+
+    private static func axElement(_ element: AXUIElement, _ name: String) -> AXUIElement? {
+        guard let value = axRaw(element, name), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    private static func axElements(_ element: AXUIElement, _ name: String) -> [AXUIElement] {
+        guard let value = axRaw(element, name), CFGetTypeID(value) == CFArrayGetTypeID() else { return [] }
+        // 逐项验类型再转换：数组里混入非元素对象时不至于崩溃
+        return (value as! [AnyObject]).compactMap { item in
+            CFGetTypeID(item) == AXUIElementGetTypeID() ? unsafeBitCast(item, to: AXUIElement.self) : nil
+        }
+    }
+
+    /// 备忘录当前打开的窗口数（AX 通道；读不到返回 nil 交由调用方回退）
+    private static func axWindowCount() -> Int? {
+        guard canPasteIntoNotes, let app = notesAXApp(),
+              let value = axRaw(app, "AXWindows"), CFGetTypeID(value) == CFArrayGetTypeID()
+        else { return nil }
+        return (value as! [AXUIElement]).count
+    }
+
+    /// 备忘录当前聚焦元素（AX 通道）
+    private static func axFocusedElement() -> AXUIElement? {
+        guard canPasteIntoNotes, let app = notesAXApp() else { return nil }
+        return axElement(app, "AXFocusedUIElement")
+    }
+
+    /// AX 点击备忘录菜单项：读 menu bar → 对应菜单 → 目标菜单项，执行 AXPress
+    private static func clickNotesMenuAX(pairs: [(item: String, bar: String)]) -> Bool {
+        guard canPasteIntoNotes, let app = notesAXApp(),
+              let menuBar = axElement(app, "AXMenuBar") else { return false }
+        for pair in pairs {
+            guard let barItem = axElements(menuBar, "AXChildren")
+                    .first(where: { axString($0, "AXTitle") == pair.bar }) else { continue }
+            // 先确认目标菜单项存在，避免按下菜单栏项后没有东西可点、菜单悬着不收起
+            let hasItem = axElements(barItem, "AXChildren").contains { menu in
+                axElements(menu, "AXChildren").contains { axString($0, "AXTitle") == pair.item }
+            }
+            guard hasItem else { continue }
+            // 备忘录的菜单项要等菜单处于展开状态才响应 AXPress：
+            // 先按菜单栏项展开，再点目标项（实测直接点菜单项不会生效）
+            _ = AXUIElementPerformAction(barItem, "AXPress" as CFString)
+            for menu in axElements(barItem, "AXChildren") {
+                for item in axElements(menu, "AXChildren") where axString(item, "AXTitle") == pair.item {
+                    if AXUIElementPerformAction(item, "AXPress" as CFString) == .success { return true }
+                }
+            }
+            // 没点中：再按一次菜单栏项，收起刚才展开的菜单
+            _ = AXUIElementPerformAction(barItem, "AXPress" as CFString)
+        }
+        return false
     }
 
     /// 最近一次 createNoteByPasting 失败的原因（供状态栏提示；空字符串表示无需提示）
@@ -204,19 +303,35 @@ enum NotesService {
         let before = allNoteIDs()
         // 文件→新建备忘录：无论当前是 0 窗口还是有窗口，Notes 都会创建新笔记
         // 并把编辑器聚焦（0 窗口时会新开一个窗口）
-        guard clickNotesMenu(pairs: [("新建备忘录", "文件"), ("New Note", "File")]) else {
+        // 先记下当前聚焦的笔记：新建成功后焦点必然落到一条新笔记上。
+        // 用它判断点击是否真的生效，避免菜单点击没起作用时把内容粘贴进旧笔记。
+        let prevFocus = focusedNoteTextAreaID()
+        let newNotePairs: [(item: String, bar: String)] = [("新建备忘录", "文件"), ("New Note", "File")]
+        guard clickNotesMenu(pairs: newNotePairs) else {
             lastPasteFailureHint = "点击「文件→新建备忘录」失败"
             return nil
         }
-        // 等新笔记编辑器聚焦（焦点元素变为 AXTextArea），最多 6 秒
+        // 等新笔记编辑器聚焦（焦点元素为 AXTextArea，且不是原来那条笔记），最多 6 秒
+        var focus = focusedNoteTextAreaID()
         var elapsed = 0.0
-        while elapsed < 6, focusedNoteTextAreaID() == nil {
+        while elapsed < 6, focus == nil || focus == prevFocus {
             Thread.sleep(forTimeInterval: 0.2)
             elapsed += 0.2
+            focus = focusedNoteTextAreaID()
         }
-        guard focusedNoteTextAreaID() != nil else {
+        if focus == nil || focus == prevFocus {
+            // 备忘录偶尔会吞掉第一次点击，再点一次并再等 3 秒
+            _ = clickNotesMenu(pairs: newNotePairs)
+            var retried = 0.0
+            while retried < 3, focus == nil || focus == prevFocus {
+                Thread.sleep(forTimeInterval: 0.2)
+                retried += 0.2
+                focus = focusedNoteTextAreaID()
+            }
+        }
+        guard focus != nil, focus != prevFocus else {
             for id in allNoteIDs().subtracting(before) { deleteNote(id: id) }
-            lastPasteFailureHint = "等待备忘录编辑器就绪超时"
+            lastPasteFailureHint = "「新建备忘录」未生效（编辑器未切换到新笔记）"
             return nil
         }
         Thread.sleep(forTimeInterval: 0.15)
@@ -227,7 +342,14 @@ enum NotesService {
             return nil
         }
         Thread.sleep(forTimeInterval: 1.2)
-        let newIDs = allNoteIDs().subtracting(before)
+        // 新建的笔记可能要稍后才出现在 Apple Events 的笔记列表里（iCloud 同步），多等几秒
+        var newIDs = allNoteIDs().subtracting(before)
+        var listed = 0.0
+        while newIDs.isEmpty && listed < 6 {
+            Thread.sleep(forTimeInterval: 0.5)
+            listed += 0.5
+            newIDs = allNoteIDs().subtracting(before)
+        }
         guard !newIDs.isEmpty else {
             lastPasteFailureHint = "未检测到新建的备忘录"
             return nil
@@ -279,6 +401,7 @@ enum NotesService {
 
     /// 备忘录当前打开的窗口数（查询失败返回 -1，按有窗口处理）
     private static func notesWindowCount() -> Int {
+        if let n = axWindowCount() { return n }
         let script = "tell application \"System Events\" to get count of windows of (first process whose name is \"Notes\")"
         guard case .success(let out) = runAppleScript(script, args: []) else { return -1 }
         return Int(out) ?? -1
@@ -312,8 +435,24 @@ enum NotesService {
     }
 
     /// 点击备忘录菜单项：按顺序尝试 (菜单项名, 菜单栏项名) 各对（兼容中英文 UI）。
-    /// 菜单点击是 AX 动作，不产生 HID 键盘/鼠标事件。
+    /// 优先用本进程 AX 通道（见上）；仅在 AX 不可用时回退 System Events 脚本。
     private static func clickNotesMenu(pairs: [(item: String, bar: String)]) -> Bool {
+        if clickNotesMenuAX(pairs: pairs) {
+            lastMenuClickChannel = "ax"
+            return true
+        }
+        let ok = clickNotesMenuSystemEvents(pairs: pairs)
+        lastMenuClickChannel = ok ? "system-events" : ""
+        return ok
+    }
+
+    /// 最近一次菜单点击走的通道（"ax" / "system-events" / ""）。
+    /// 出现 "system-events" 说明本进程 AX 通道没起作用，往往意味着这次操作
+    /// 需要「设备控制和数据访问」授权；调试日志据此定位权限问题的来源。
+    private(set) static var lastMenuClickChannel = ""
+
+    /// 回退路径：让 System Events 代点菜单（需要「设备控制和数据访问」授权）
+    private static func clickNotesMenuSystemEvents(pairs: [(item: String, bar: String)]) -> Bool {
         for pair in pairs {
             let script = """
             on run argv
@@ -347,6 +486,10 @@ enum NotesService {
     /// 备忘录当前焦点元素若为笔记正文（AXTextArea），返回其 AXIdentifier（形如 Note[id=UUID]），否则 nil。
     /// 直接查询 Notes 进程（不依赖其是否前台）。
     private static func focusedNoteTextAreaID() -> String? {
+        if let fe = axFocusedElement(), axString(fe, "AXRole") == "AXTextArea" {
+            let id = axString(fe, "AXIdentifier") ?? ""
+            return id.isEmpty ? nil : id
+        }
         let script = """
         on run
             tell application "System Events"
@@ -368,6 +511,10 @@ enum NotesService {
     /// 备忘录当前聚焦编辑器（AXTextArea）的文本长度；非文本区或读不到返回 -1。
     /// 读取走 AX，不被 Notes 导入图片时的 Apple Events 阻塞，用于快速判断粘贴是否送达。
     private static func focusedEditorTextLength() -> Int {
+        if let fe = axFocusedElement(), axString(fe, "AXRole") == "AXTextArea",
+           let value = axString(fe, "AXValue") {
+            return value.count
+        }
         let script = """
         on run
             tell application "System Events"
@@ -421,8 +568,15 @@ enum NotesService {
             .first(where: { $0.bundleIdentifier == notesBundleID }) {
             notes.activate()
         }
-        _ = runAppleScript("tell application \"System Events\" to set frontmost of (first process whose name is \"Notes\") to true",
-                           args: [], timeout: 10)
+        // 用 AX 置前，避免再让 System Events 代做一次「控制」
+        if let app = notesAXApp() {
+            if AXUIElementSetAttributeValue(app, "AXFrontmost" as CFString, kCFBooleanTrue) != .success {
+                _ = runAppleScript("tell application \"System Events\" to set frontmost of (first process whose name is \"Notes\") to true",
+                                   args: [], timeout: 10)
+            }
+        }
+        // 刚置前时菜单栏可能还没准备好，立刻点菜单容易被吞掉
+        Thread.sleep(forTimeInterval: 0.25)
         return true
     }
 
@@ -484,9 +638,9 @@ enum NotesService {
         let before = allNoteIDs()
         add("before count=\(before.count)")
         copyRich(markdown: markdown, preloadLocalImages: true)
-        add("list-view click=\(clickNotesMenu(pairs: [("列表视图", "显示"), ("List View", "View")]))")
+        add("list-view click=\(clickNotesMenu(pairs: [("列表视图", "显示"), ("List View", "View")])) channel=\(lastMenuClickChannel)")
         Thread.sleep(forTimeInterval: 0.4)
-        add("new-note click=\(clickNotesMenu(pairs: [("新建备忘录", "文件"), ("New Note", "File")]))")
+        add("new-note click=\(clickNotesMenu(pairs: [("新建备忘录", "文件"), ("New Note", "File")])) channel=\(lastMenuClickChannel)")
         for i in 1...30 {
             Thread.sleep(forTimeInterval: 0.2)
             let fid = focusedNoteTextAreaID()
@@ -494,7 +648,7 @@ enum NotesService {
             if fid != nil { break }
         }
         Thread.sleep(forTimeInterval: 0.15)
-        add("paste click=\(clickNotesMenu(pairs: [("粘贴", "编辑"), ("Paste", "Edit")]))")
+        add("paste click=\(clickNotesMenu(pairs: [("粘贴", "编辑"), ("Paste", "Edit")])) channel=\(lastMenuClickChannel)")
         Thread.sleep(forTimeInterval: 1.2)
         let newIDs = allNoteIDs().subtracting(before)
         add("newIDs=\(newIDs.sorted())")
@@ -526,6 +680,26 @@ enum NotesService {
         p.standardOutput = outPipe
         p.standardError = errPipe
         do { try p.run() } catch { return .failure(error) }
+
+        // 先起后台线程把两条管道读空，再等待进程退出。
+        // 备忘录正文 HTML 可达数百 KB（带表格的笔记尤其大），超过管道缓冲区
+        // （64KB）后 osascript 会阻塞在 write 上；原先「先 waitUntilExit 再读管道」
+        // 的写法在这种笔记上永久死锁，表现为「打开备忘录」后编辑区一片空白。
+        let outBox = DataBox()
+        let errBox = DataBox()
+        let readers = DispatchGroup()
+        readers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            outBox.append(outPipe.fileHandleForReading.readDataToEndOfFile())
+            readers.leave()
+        }
+        readers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            errBox.append(errPipe.fileHandleForReading.readDataToEndOfFile())
+            readers.leave()
+        }
+
+        var timedOut = false
         if let timeout = timeout {
             let deadline = Date().addingTimeInterval(timeout)
             while p.isRunning && Date() < deadline {
@@ -537,18 +711,45 @@ enum NotesService {
                 while p.isRunning && Date() < t2 {
                     Thread.sleep(forTimeInterval: 0.05)
                 }
+                if p.isRunning {
+                    kill(p.processIdentifier, SIGKILL)
+                    timedOut = true
+                }
             }
         } else {
             p.waitUntilExit()
         }
-        let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        // 进程已退出或被杀，管道必然到达 EOF；仍设 5 秒上限，避免极端情况卡住调用方
+        _ = readers.wait(timeout: .now() + 5)
+        let out = String(data: outBox.data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        let err = String(data: errBox.data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if timedOut {
+            return .failure(NSError(domain: "NotesMD", code: 6,
+                                     userInfo: [NSLocalizedDescriptionKey:
+                                                    "备忘录响应超时（\(Int(timeout ?? 0)) 秒）"]))
+        }
         if p.terminationStatus != 0 {
             return .failure(NSError(domain: "NotesMD", code: Int(p.terminationStatus),
                                      userInfo: [NSLocalizedDescriptionKey: err.isEmpty ? "AppleScript 执行失败" : err]))
         }
         return .success(out)
+    }
+}
+
+/// 供后台线程回填的 Data 容器（加锁，便于安全地在读管道线程与调用线程之间传递）
+private final class DataBox {
+    private let lock = NSLock()
+    private var storage = Data()
+    func append(_ data: Data) {
+        lock.lock()
+        storage.append(data)
+        lock.unlock()
+    }
+    var data: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }

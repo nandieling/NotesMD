@@ -1076,10 +1076,10 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
         if loadContent {
             loadBoundNoteIntoEditor(name: name)
         }
-        if !silent {
-            setStatus(loadContent
-                      ? "已打开备忘录「\(name)」，内容已加载进编辑区；点「更新备忘录」可写回"
-                      : "已关联备忘录「\(name)」，点「更新备忘录」即可写入")
+        // loadContent 时成功/失败提示都由 loadBoundNoteIntoEditor 读完后给出，
+        // 这里提前报「已打开」会在读取失败时留下「提示成功但编辑区空白」的误导
+        if !silent, !loadContent {
+            setStatus("已关联备忘录「\(name)」，点「更新备忘录」即可写入")
         }
     }
 
@@ -1087,25 +1087,40 @@ final class EditorWindowController: NSWindowController, NSTextViewDelegate, NSWi
     private func loadBoundNoteIntoEditor(name: String) {
         setStatus("正在读取备忘录内容…")
         DispatchQueue.global(qos: .userInitiated).async {
-            var markdown = ""
-            if let id = NoteBinding.id,
-               case .success(let html) = NotesService.noteHTML(id: id) {
-                markdown = MarkdownFromHTML.convert(html)
-                // Notes 读回的 HTML 丢失表格列对齐：用最近一次写入该备忘录的
-                // markdown 恢复 :---: / ---: 对齐行（表头一致才匹配）
-                if let cached = NotePushCache.markdown(for: id) {
-                    markdown = MarkdownFromHTML.restoreTableAlignments(markdown, from: cached)
+            let result: Result<String, Error>
+            if let id = NoteBinding.id {
+                result = NotesService.noteHTML(id: id).map { html in
+                    var converted = MarkdownFromHTML.convert(html)
+                    // Notes 读回的 HTML 丢失表格列对齐：用最近一次写入该备忘录的
+                    // markdown 恢复 :---: / ---: 对齐行（表头一致才匹配）
+                    if let cached = NotePushCache.markdown(for: id) {
+                        converted = MarkdownFromHTML.restoreTableAlignments(converted, from: cached)
+                    }
+                    return converted
                 }
+            } else {
+                result = .failure(NSError(domain: "NotesMD", code: 5,
+                                          userInfo: [NSLocalizedDescriptionKey: "尚未关联备忘录"]))
             }
             DispatchQueue.main.async {
                 // 期间用户已换绑其他笔记时丢弃过期结果
                 guard NoteBinding.name == name else { return }
-                self.isProgrammaticChange = true
-                self.setEditorPlainText(markdown)
-                self.isProgrammaticChange = false
-                self.refreshPreview()
-                // 读回的内容与备忘录一致，视为已同步：关闭时不再提醒更新
-                self.hasPushedToNotes = true
+                switch result {
+                case .success(let markdown):
+                    self.isProgrammaticChange = true
+                    self.setEditorPlainText(markdown)
+                    self.isProgrammaticChange = false
+                    self.refreshPreview()
+                    // 读回的内容与备忘录一致，视为已同步：关闭时不再提醒更新
+                    self.hasPushedToNotes = true
+                    self.setStatus(markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                   ? "已打开备忘录「\(name)」，该备忘录没有可还原的文本内容"
+                                   : "已打开备忘录「\(name)」，内容已加载进编辑区；点「更新备忘录」可写回")
+                case .failure(let error):
+                    // 读取失败：编辑区保持原样（原先会被清空却提示「已打开」），
+                    // 也不把「还没写回备忘录」误标成已同步
+                    self.setStatus("打开备忘录「\(name)」失败：\(error.localizedDescription)")
+                }
                 // 读取备忘录时 AppleScript 会把「备忘录」App 带到前台，
                 // 内容加载完成后自动跳回 NotesMD 主窗口
                 NSApp.activate(ignoringOtherApps: true)
